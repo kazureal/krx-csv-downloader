@@ -1,18 +1,13 @@
-# Korea Raw OHLCV CSV v0.5 diagnostic
+# Korea OHLCV CSV v0.6
 
-v0.4 수집 로직을 그대로 유지하고, OHLC 관계 오류의 원인을 노출하는 진단판.
+원자료 보존형 수집기.
 
-추가한 것:
-- 오류 날짜
-- O/H/L/C/V
-- 실패 조건
-- 필요한 최소 High / 최대 Low
-- Naver XML item의 원문 raw_data
-- 진단 CSV 다운로드
+- NAVER FCHART 값을 source_* 필드에 그대로 보존
+- OHLC 관계 오류 자동 수정 금지
+- verified_* 는 독립 출처 검증 전 비움
+- crosscheck_status 기본 NOT_CHECKED
+- research_ready 기본 False
+- 수정/비수정 가격을 한 열에 혼합하지 않음
 
-중요:
-- 오류 행 삭제 안 함
-- 가격 임의 보정 안 함
-- 검증 기준 완화 안 함
-- 검증 실패 시 일반 OHLCV CSV 생성 금지
-- 연구/백테스트 로직과 분리
+v0.6은 '완성된 이중 수집기'가 아니라 안전한 데이터 스키마 단계입니다.
+독립 2차 출처가 확정되기 전에는 검증값을 생성하지 않습니다.
