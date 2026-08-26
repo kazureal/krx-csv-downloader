@@ -5,7 +5,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-st.set_page_config(page_title="Korea OHLCV CSV v0.3", page_icon="📈")
+st.set_page_config(page_title="Korea OHLCV CSV v0.4", page_icon="📈")
 HEADERS = {
     "User-Agent": "Mozilla/5.0",
     "Accept-Language": "ko-KR,ko;q=0.9"
@@ -68,6 +68,27 @@ def resolve_name(q):
 
     return None
 
+def parse_naver_xml(content: bytes):
+    """
+    Naver legacy chart XML may declare EUC-KR/CP949.
+    Python 3.14 ElementTree/expat can raise:
+      ValueError: multi-byte encodings are not supported
+    So decode bytes first, remove XML encoding declaration, then parse Unicode.
+    """
+    text = None
+    for enc in ("euc-kr", "cp949", "utf-8"):
+        try:
+            text = content.decode(enc)
+            break
+        except UnicodeDecodeError:
+            continue
+    if text is None:
+        text = content.decode("utf-8", errors="replace")
+
+    # Remove XML declaration entirely to avoid expat re-processing legacy encoding.
+    text = re.sub(r'^\s*<\?xml[^>]*\?>', '', text, count=1, flags=re.I)
+    return ET.fromstring(text)
+
 def fetch(code, start, end):
     days = max((end - start).days, 1)
     count = min(max(days * 2, 400), 20000)
@@ -80,7 +101,8 @@ def fetch(code, start, end):
     )
     r.raise_for_status()
 
-    root = ET.fromstring(r.content)
+    root = parse_naver_xml(r.content)
+
     rows = []
     for it in root.iter("item"):
         p = it.attrib.get("data", "").split("|")
@@ -101,7 +123,6 @@ def fetch(code, start, end):
 
     df = df.dropna(subset=["date", "open", "high", "low", "close", "volume"])
 
-    # v0.2 ValueError fix: do NOT use pandas.query with date.dt.date.
     mask = (df["date"].dt.date >= start) & (df["date"].dt.date <= end)
     df = df.loc[mask].copy()
 
@@ -118,7 +139,6 @@ def fetch(code, start, end):
 
 def validate(df):
     errors, warnings = [], []
-
     if df.empty:
         return ["데이터가 0행입니다."], []
 
@@ -147,7 +167,7 @@ def validate(df):
     return errors, warnings
 
 st.title("Korea Raw OHLCV CSV")
-st.caption("데이터 취득 전용 v0.3 · 연구 규칙/분석 기능 없음")
+st.caption("데이터 취득 전용 v0.4 · 연구 규칙/분석 기능 없음")
 st.info("네이버증권 공개 시세를 1차 수집원으로 사용합니다. KRX 직접 원자료라고 표시하지 않습니다.")
 
 q = st.text_input("종목명 또는 6자리 종목코드", placeholder="예: 펩트론 또는 087010")
@@ -175,7 +195,6 @@ if st.button("OHLCV CSV 만들기", type="primary", use_container_width=True):
             st.stop()
 
     errors, warnings = validate(df)
-
     if errors:
         st.error("검증 실패 — CSV 생성을 중단했습니다: " + " / ".join(errors))
         st.stop()
