@@ -5,7 +5,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-st.set_page_config(page_title="Korea OHLCV CSV v0.4", page_icon="📈")
+st.set_page_config(page_title="Korea OHLCV CSV v0.5", page_icon="📈")
 HEADERS = {
     "User-Agent": "Mozilla/5.0",
     "Accept-Language": "ko-KR,ko;q=0.9"
@@ -17,7 +17,6 @@ def resolve_name(q):
     if re.fullmatch(r"\d{6}", q):
         return {"name": q, "code": q}
 
-    # Naver Finance autocomplete
     try:
         r = requests.get(
             "https://ac.finance.naver.com/ac",
@@ -41,7 +40,6 @@ def resolve_name(q):
     except Exception:
         pass
 
-    # Naver mobile autocomplete fallback
     try:
         r = requests.get(
             "https://m.stock.naver.com/front-api/search/autoComplete",
@@ -69,12 +67,6 @@ def resolve_name(q):
     return None
 
 def parse_naver_xml(content: bytes):
-    """
-    Naver legacy chart XML may declare EUC-KR/CP949.
-    Python 3.14 ElementTree/expat can raise:
-      ValueError: multi-byte encodings are not supported
-    So decode bytes first, remove XML encoding declaration, then parse Unicode.
-    """
     text = None
     for enc in ("euc-kr", "cp949", "utf-8"):
         try:
@@ -84,8 +76,6 @@ def parse_naver_xml(content: bytes):
             continue
     if text is None:
         text = content.decode("utf-8", errors="replace")
-
-    # Remove XML declaration entirely to avoid expat re-processing legacy encoding.
     text = re.sub(r'^\s*<\?xml[^>]*\?>', '', text, count=1, flags=re.I)
     return ET.fromstring(text)
 
@@ -105,14 +95,23 @@ def fetch(code, start, end):
 
     rows = []
     for it in root.iter("item"):
-        p = it.attrib.get("data", "").split("|")
+        raw = it.attrib.get("data", "")
+        p = raw.split("|")
         if len(p) >= 6 and re.fullmatch(r"\d{8}", p[0]):
-            rows.append(p[:6])
+            rows.append({
+                "raw_data": raw,
+                "date": p[0],
+                "open": p[1],
+                "high": p[2],
+                "low": p[3],
+                "close": p[4],
+                "volume": p[5],
+            })
 
     if not rows:
         return pd.DataFrame()
 
-    df = pd.DataFrame(rows, columns=["date", "open", "high", "low", "close", "volume"])
+    df = pd.DataFrame(rows)
     df["date"] = pd.to_datetime(df["date"], format="%Y%m%d", errors="coerce")
 
     for c in ["open", "high", "low", "close", "volume"]:
@@ -137,6 +136,34 @@ def fetch(code, start, end):
 
     return df
 
+def diagnose_ohlc(df):
+    if df.empty:
+        return pd.DataFrame()
+
+    max_ocl = df[["open", "close", "low"]].max(axis=1)
+    min_och = df[["open", "close", "high"]].min(axis=1)
+
+    high_bad = df["high"] < max_ocl
+    low_bad = df["low"] > min_och
+    bad = high_bad | low_bad
+
+    diag = df.loc[bad, ["date", "open", "high", "low", "close", "volume", "raw_data"]].copy()
+    diag["high_lt_required_max"] = high_bad.loc[bad].values
+    diag["required_high_min"] = max_ocl.loc[bad].values
+    diag["low_gt_required_min"] = low_bad.loc[bad].values
+    diag["required_low_max"] = min_och.loc[bad].values
+
+    def reason(row):
+        reasons = []
+        if row["high_lt_required_max"]:
+            reasons.append("HIGH < max(O,C,L)")
+        if row["low_gt_required_min"]:
+            reasons.append("LOW > min(O,C,H)")
+        return " + ".join(reasons)
+
+    diag["failure_reason"] = diag.apply(reason, axis=1)
+    return diag
+
 def validate(df):
     errors, warnings = [], []
     if df.empty:
@@ -148,12 +175,9 @@ def validate(df):
     if not df["date"].is_monotonic_increasing:
         errors.append("날짜 정렬 오류")
 
-    bad = (
-        (df["high"] < df[["open", "close", "low"]].max(axis=1)) |
-        (df["low"] > df[["open", "close", "high"]].min(axis=1))
-    )
-    if bad.any():
-        errors.append(f"OHLC 관계 오류 {int(bad.sum())}행")
+    diag = diagnose_ohlc(df)
+    if not diag.empty:
+        errors.append(f"OHLC 관계 오류 {len(diag)}행")
 
     if (df[["open", "high", "low", "close"]] <= 0).any().any():
         errors.append("0 이하 가격")
@@ -167,7 +191,7 @@ def validate(df):
     return errors, warnings
 
 st.title("Korea Raw OHLCV CSV")
-st.caption("데이터 취득 전용 v0.4 · 연구 규칙/분석 기능 없음")
+st.caption("데이터 취득 전용 v0.5 진단판 · 연구 규칙/분석 기능 없음")
 st.info("네이버증권 공개 시세를 1차 수집원으로 사용합니다. KRX 직접 원자료라고 표시하지 않습니다.")
 
 q = st.text_input("종목명 또는 6자리 종목코드", placeholder="예: 펩트론 또는 087010")
@@ -177,12 +201,12 @@ with a:
 with b:
     end = st.date_input("종료일", date.today())
 
-if st.button("OHLCV CSV 만들기", type="primary", use_container_width=True):
+if st.button("OHLCV 진단 실행", type="primary", use_container_width=True):
     if start > end:
         st.error("시작일이 종료일보다 늦습니다.")
         st.stop()
 
-    with st.spinner("수집 중..."):
+    with st.spinner("수집 및 진단 중..."):
         x = resolve_name(q)
         if not x:
             st.error("종목을 찾지 못했습니다. 6자리 코드로 다시 시도해 주세요.")
@@ -194,20 +218,54 @@ if st.button("OHLCV CSV 만들기", type="primary", use_container_width=True):
             st.error(f"시세 수집 실패: {type(ex).__name__}: {ex}")
             st.stop()
 
-    errors, warnings = validate(df)
-    if errors:
-        st.error("검증 실패 — CSV 생성을 중단했습니다: " + " / ".join(errors))
-        st.stop()
+    st.write(f"종목: {x['name']} ({x['code']})")
+    st.write(f"수집 행수: {len(df):,}")
 
-    st.success(f'{x["name"]} ({x["code"]}) · {len(df):,}행')
-    st.write(f"기간: {df['date'].min().date()} ~ {df['date'].max().date()}")
+    if not df.empty:
+        st.write(f"수집 기간: {df['date'].min().date()} ~ {df['date'].max().date()}")
+
+    errors, warnings = validate(df)
+    diag = diagnose_ohlc(df)
+
+    if errors:
+        st.error("검증 실패: " + " / ".join(errors))
+
+        if not diag.empty:
+            st.subheader(f"OHLC 오류 상세 ({len(diag)}행)")
+            st.caption("아래 행은 삭제·보정하지 않은 진단용 표시입니다.")
+            show = diag.copy()
+            show["date"] = show["date"].dt.strftime("%Y-%m-%d")
+            st.dataframe(
+                show[
+                    [
+                        "date", "open", "high", "low", "close", "volume",
+                        "failure_reason", "required_high_min", "required_low_max",
+                        "raw_data"
+                    ]
+                ],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            diag_csv = show.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+            st.download_button(
+                "진단 CSV 다운로드",
+                diag_csv,
+                file_name=f'{x["code"]}_OHLC_DIAGNOSTIC.csv',
+                mime="text/csv",
+                use_container_width=True,
+            )
+
+        st.warning("진단판에서는 검증 실패 데이터의 일반 CSV 다운로드를 허용하지 않습니다.")
+        st.stop()
 
     for w in warnings:
         st.warning(w)
 
-    st.dataframe(df.tail(10), use_container_width=True, hide_index=True)
+    st.success("기본 OHLC 검증 통과")
+    st.dataframe(df.tail(10).drop(columns=["raw_data"]), use_container_width=True, hide_index=True)
 
-    z = df.copy()
+    z = df.drop(columns=["raw_data"]).copy()
     z["date"] = z["date"].dt.strftime("%Y-%m-%d")
     z["primary_source"] = "NAVER_FCHART"
     z["crosscheck_source"] = ""
@@ -223,4 +281,3 @@ if st.button("OHLCV CSV 만들기", type="primary", use_container_width=True):
         "text/csv",
         use_container_width=True
     )
-    st.caption("crosscheck 필드는 의도적으로 비워 둡니다. 연구 투입 전 별도 교차검증이 필요합니다.")
