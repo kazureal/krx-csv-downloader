@@ -1,18 +1,17 @@
-# Korea OHLCV CSV v0.7
+# Korea OHLCV CSV v0.8
 
-NAVER FCHART 원본을 보존하면서 금융위원회_주식시세정보(data.go.kr)를 별도 열로 교차검증하는 버전.
+최종 단순 수집기.
 
-Streamlit Secrets:
-DATA_GO_KR_SERVICE_KEY = "공공데이터포털에서 발급받은 서비스키"
+기능:
+- NAVER FCHART 일봉 OHLCV 수집
+- OHLC 관계 이상 자동 표시
+- 원본 가격 자동 수정 금지
+- CSV 다운로드
 
-원칙:
-- NAVER 값 자동 수정 금지
-- 공공데이터 값도 별도 열로 보존
-- exact OHLC / OHLCV match를 구분
-- 단순 불일치는 SOURCE_CONFLICT_OR_BASIS_DIFFERENT로 표시
-- 내부 OHLC 정상 + 공공데이터 OHLCV 완전일치만 research_ready=True
-- 공공데이터 키가 없거나 조회 실패하면 research_ready=False
+CSV:
+date, open, high, low, close, volume, ohlc_warning, source, auto_corrected
 
-공식 API:
-금융위원회_주식시세정보
-GetStockSecuritiesInfoService/getStockPriceInfo
+주의:
+NAVER FCHART의 과거 가격은 corporate action이 반영된 차트/수정 가격계열일 수 있다.
+이 앱은 KRX 당시 실제 비수정 체결가격이라고 주장하지 않는다.
+중요한 투자/연구 구간의 교차검증은 별도 분석 단계에서 수행한다.
