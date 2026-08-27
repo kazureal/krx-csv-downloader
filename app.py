@@ -7,7 +7,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-st.set_page_config(page_title="Korea OHLCV CSV v0.9.7 STOCK + INDEX", page_icon="📈")
+st.set_page_config(page_title="Korea OHLCV CSV v0.9.8 STOCK + INDEX", page_icon="📈")
 
 H = {
     "User-Agent": "Mozilla/5.0",
@@ -538,15 +538,21 @@ def _standardize_index(df, source, index_code, index_name):
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_krx_index(code, name, start, end):
     """
-    KRX index OHLCV via pykrx low-level KRX wrapper.
-    - Long requests are split into <= 700 calendar-day chunks.
-    - Each chunk is audited; no interpolation/backfill.
-    - Low-level wrapper is tried first to avoid public ticker-name lookup failures.
+    KRX index OHLCV.
+    v0.9.8:
+    - pykrx public get_index_ohlcv* 경로의 '지수명' KeyError를 우회한다.
+    - pykrx의 KRX core '개별지수시세' fetch를 직접 호출한다.
+    - code 1001 -> market='1', index='001'; code 2001 -> market='2', index='001'
+    - 긴 기간은 <=700 calendar-day 조각으로 수집한다.
+    - 원자료를 수정/보간하지 않는다.
     """
     try:
         import pykrx
+        from pykrx.website.krx.market.core import 개별지수시세
     except Exception as ex:
-        raise RuntimeError("pykrx를 불러오지 못했습니다. requirements.txt 설치 상태를 확인하세요.") from ex
+        raise RuntimeError(
+            "pykrx KRX core를 불러오지 못했습니다. requirements.txt/pykrx 버전을 확인하세요."
+        ) from ex
 
     diag = {
         "pykrx_version": getattr(pykrx, "__version__", "unknown"),
@@ -556,61 +562,79 @@ def fetch_krx_index(code, name, start, end):
         "requested_end": str(end),
         "chunks": [],
     }
+
+    if not (isinstance(code, str) and len(code) == 4 and code.isdigit()):
+        raise ValueError(f"지원하지 않는 지수코드 형식: {code}")
+
+    market_code = code[0]   # 1=KOSPI 계열, 2=KOSDAQ 계열
+    index_code = code[1:]   # 001
+
     pieces = []
     cur = start
     while cur <= end:
         chunk_end = min(cur + timedelta(days=699), end)
         rec = {
             "start": str(cur), "end": str(chunk_end), "rows": 0,
-            "actual_start": "", "actual_end": "", "method": "",
+            "actual_start": "", "actual_end": "",
+            "method": "pykrx_core_개별지수시세",
             "status": "", "error": "",
         }
         try:
-            df = None
-            errors = []
-            # Preferred: low-level KRX wrapper. It avoids the public index-name
-            # lookup layer that has broken in some pykrx/KRX combinations.
-            try:
-                from pykrx.website.krx.market import wrap as krx_wrap
-                fn = getattr(krx_wrap, "get_index_ohlcv_by_date")
-                df = fn(cur.strftime("%Y%m%d"), chunk_end.strftime("%Y%m%d"), code)
-                rec["method"] = "pykrx_lowlevel_krx"
-            except Exception as ex1:
-                errors.append(f"lowlevel:{type(ex1).__name__}:{ex1}")
+            raw = 개별지수시세().fetch(
+                index_code,
+                market_code,
+                cur.strftime("%Y%m%d"),
+                chunk_end.strftime("%Y%m%d"),
+            )
 
-            if df is None or df.empty:
-                try:
-                    from pykrx import stock
-                    fn = getattr(stock, "get_index_ohlcv_by_date")
-                    df = fn(cur.strftime("%Y%m%d"), chunk_end.strftime("%Y%m%d"), code)
-                    rec["method"] = "pykrx_public_by_date"
-                except Exception as ex2:
-                    errors.append(f"public_by_date:{type(ex2).__name__}:{ex2}")
-
-            if df is None or df.empty:
-                try:
-                    from pykrx import stock
-                    # Some versions expose the generic dispatcher and support
-                    # name_display=False, which bypasses ticker-name metadata.
-                    df = stock.get_index_ohlcv(
-                        cur.strftime("%Y%m%d"), chunk_end.strftime("%Y%m%d"), code,
-                        name_display=False,
-                    )
-                    rec["method"] = "pykrx_public_dispatcher"
-                except Exception as ex3:
-                    errors.append(f"dispatcher:{type(ex3).__name__}:{ex3}")
-
-            if df is None or df.empty:
+            if raw is None or raw.empty:
                 rec["status"] = "INDEX_EMPTY"
-                rec["error"] = " | ".join(errors)
             else:
-                x = df.reset_index()
-                out = _standardize_index(x, "KRX_INDEX", code, name)
-                rec["rows"] = int(len(out))
-                rec["actual_start"] = str(out.date.min().date())
-                rec["actual_end"] = str(out.date.max().date())
-                rec["status"] = "INDEX_OK"
-                pieces.append(out)
+                required = [
+                    "TRD_DD", "OPNPRC_IDX", "HGPRC_IDX", "LWPRC_IDX",
+                    "CLSPRC_IDX", "ACC_TRDVOL", "ACC_TRDVAL", "MKTCAP",
+                ]
+                missing = [c for c in required if c not in raw.columns]
+                if missing:
+                    rec["status"] = "INDEX_SCHEMA_ERROR"
+                    rec["error"] = (
+                        f"missing={missing}; columns={raw.columns.tolist()[:30]}"
+                    )
+                else:
+                    x = raw[required].copy()
+                    x = x.rename(columns={
+                        "TRD_DD": "date",
+                        "OPNPRC_IDX": "open",
+                        "HGPRC_IDX": "high",
+                        "LWPRC_IDX": "low",
+                        "CLSPRC_IDX": "close",
+                        "ACC_TRDVOL": "volume",
+                        "ACC_TRDVAL": "trading_value",
+                        "MKTCAP": "market_cap",
+                    })
+
+                    # KRX 문자열 숫자(콤마/공백/'-') 정리
+                    x["date"] = pd.to_datetime(
+                        x["date"], format="%Y/%m/%d", errors="coerce"
+                    )
+                    for c in [
+                        "open", "high", "low", "close",
+                        "volume", "trading_value", "market_cap",
+                    ]:
+                        x[c] = x[c].map(_clean_krx_num)
+
+                    out = _standardize_index(
+                        x, "KRX_INDEX_DIRECT_CORE", code, name
+                    )
+                    if out.empty:
+                        rec["status"] = "INDEX_EMPTY_AFTER_STANDARDIZE"
+                    else:
+                        rec["rows"] = int(len(out))
+                        rec["actual_start"] = str(out.date.min().date())
+                        rec["actual_end"] = str(out.date.max().date())
+                        rec["status"] = "INDEX_OK"
+                        pieces.append(out)
+
         except Exception as ex:
             rec["status"] = "INDEX_ERROR"
             rec["error"] = f"{type(ex).__name__}: {ex}"
@@ -620,18 +644,27 @@ def fetch_krx_index(code, name, start, end):
         time.sleep(0.15)
 
     if not pieces:
-        diag["status"] = "INDEX_EMPTY_ALL"
         diag["returned_rows"] = 0
-        return _standardize_index(pd.DataFrame(), "KRX_INDEX", code, name), diag
+        diag["status"] = "INDEX_EMPTY_ALL"
+        return _standardize_index(
+            pd.DataFrame(), "KRX_INDEX_DIRECT_CORE", code, name
+        ), diag
 
     out = pd.concat(pieces, ignore_index=True)
-    out = out.sort_values("date").drop_duplicates("date", keep="last").reset_index(drop=True)
-    out = _standardize_index(out, "KRX_INDEX", code, name)
-    all_ok = all(r.get("status") == "INDEX_OK" for r in diag["chunks"])
-    diag["status"] = "INDEX_OK" if all_ok else "INDEX_PARTIAL"
+    out = (
+        out.sort_values("date")
+        .drop_duplicates(subset=["date"], keep="last")
+        .reset_index(drop=True)
+    )
+    out = _standardize_index(
+        out, "KRX_INDEX_DIRECT_CORE", code, name
+    )
+
     diag["returned_rows"] = int(len(out))
     diag["actual_start"] = str(out.date.min().date())
     diag["actual_end"] = str(out.date.max().date())
+    all_ok = all(r.get("status") == "INDEX_OK" for r in diag["chunks"])
+    diag["status"] = "INDEX_OK" if all_ok else "INDEX_PARTIAL"
     return out, diag
 
 
@@ -701,7 +734,7 @@ def add_audit_columns(df):
     return out
 
 
-st.title("Korea OHLCV CSV v0.9.7 STOCK + INDEX")
+st.title("Korea OHLCV CSV v0.9.8 STOCK + INDEX")
 st.caption("개별주식 KRX DIRECT RAW + KOSPI/KOSDAQ 지수 일봉 · 장기기간 자동분할 · 원본 보존 · 자동보정 없음")
 
 data_kind = st.radio("수집 대상", ["개별주식", "시장지수"], horizontal=True)
@@ -744,7 +777,7 @@ else:
     source_mode = "KRX INDEX"
     krx_id = ""
     krx_pw = ""
-    st.info("시장지수는 KRX 지수 일봉 경로를 사용합니다. 개별주식 로그인/수정주가 옵션과 분리되어 있습니다.")
+    st.info("시장지수는 KRX 지수 일봉의 direct-core 경로를 사용합니다. pykrx의 '지수명' 조회 오류를 우회하며, 개별주식 기능과 분리되어 있습니다.")
 
 if st.button("OHLCV CSV 만들기", type="primary", use_container_width=True):
     if s > e:
