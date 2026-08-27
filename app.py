@@ -7,7 +7,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-st.set_page_config(page_title="Korea OHLCV CSV v0.9.5 KRX DIRECT RAW", page_icon="📈")
+st.set_page_config(page_title="Korea OHLCV CSV v0.9.6 KRX DIRECT RAW", page_icon="📈")
 
 H = {
     "User-Agent": "Mozilla/5.0",
@@ -536,7 +536,7 @@ def add_audit_columns(df):
     return out
 
 
-st.title("Korea OHLCV CSV v0.9.5 KRX DIRECT RAW")
+st.title("Korea OHLCV CSV v0.9.6 KRX DIRECT RAW")
 st.caption("KRX 직접 비수정 OHLCV · 선택적 KRX 로그인 · FDR/NAVER 대조 · 원본 보존 · 자동보정 없음")
 
 q = st.text_input(
@@ -546,9 +546,9 @@ q = st.text_input(
 
 a, b = st.columns(2)
 with a:
-    s = st.date_input("시작일", date(2000, 1, 1))
+    s = st.date_input("시작일", value=date(2000, 1, 1), min_value=date(1900, 1, 1), max_value=date.today())
 with b:
-    e = st.date_input("종료일", date.today())
+    e = st.date_input("종료일", value=date.today(), min_value=date(1900, 1, 1), max_value=date.today())
 
 source_mode = st.radio(
     "데이터 소스",
