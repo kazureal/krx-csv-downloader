@@ -1,4 +1,4 @@
-# Korea OHLCV CSV v1.0.13 — STOCK + INDEX + UNIVERSE
+# Korea OHLCV CSV v1.0.14 — STOCK + INDEX + UNIVERSE
 
 ## 이번 업데이트
 기존 v0.9.9의 동작을 유지하면서 아래를 추가했습니다.
@@ -299,3 +299,28 @@ H15/MFE/MAE future outcome은 계속 봉인.
 selection order는 변경하지 않음.
 
 첫 시험은 Batch 1 / 2종목 / 2010-01-04~2026-08-27 / 로그인 비움.
+
+
+## v1.0.14 Streamlit login form fix
+Live evidence:
+- 사용자 입력 후에도 여러 5-stock Batch audit에서 `login_attempted=False`.
+- `_krx_login()`은 ID/PW 중 하나라도 비어 있으면 attempted=False이므로,
+  자격증명 자체의 정오보다 UI→Batch 전달 단계가 우선 문제.
+
+Fix:
+- KRX ID/PW와 실행 버튼을 하나의 `st.form` 안에 배치.
+- form submit 시 한 번에 자격증명과 실행 이벤트를 전달.
+- ID 또는 PW가 비어 있으면 KRX 요청 전에 즉시 중단.
+- 화면에는 `ID/PW 입력 감지: YES / YES`만 표시.
+- batch_audit에는 실제 자격증명 대신
+  `login_id_present_at_batch_function`, `login_pw_present_at_batch_function`
+  boolean만 기록.
+- ID/PW 값, 길이, 해시 등은 기록하지 않음.
+- Batch request diagnostic과 HHMMSS CSV prefix는 유지.
+- selection order 및 H15/MFE/MAE outcome 봉인 유지.
+
+Next live test:
+- Batch size 5
+- Batch no 1
+- 동일 기간
+- form 안에서 ID/PW 입력 → 같은 form의 실행 버튼 클릭

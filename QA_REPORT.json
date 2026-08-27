@@ -1,11 +1,18 @@
 {
-  "version": "1.0.13",
+  "version": "1.0.14",
   "date": "2026-08-27",
-  "purpose": "KRX Batch HTTP 400 diagnostics",
-  "compile": "PASS",
-  "diagnostic_static_QA": "PASS",
-  "credentials_logged": false,
-  "future_outcomes_opened": false,
-  "selection_order_changed": false,
+  "purpose": "Atomic Streamlit credential submission for Batch KRX",
+  "checks": {
+    "compile_app": true,
+    "compile_engine": true,
+    "credentials_and_submit_same_form": true,
+    "empty_credentials_block_before_request": true,
+    "audit_records_presence_booleans_only": true,
+    "credential_values_logged": false,
+    "request_diagnostic_retained": true,
+    "hhmmss_csv_prefix_retained": true,
+    "selection_order_changed": false,
+    "future_outcomes_opened": false
+  },
   "live_retest_required": true
 }

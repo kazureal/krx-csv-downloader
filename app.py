@@ -12,9 +12,9 @@ import pandas as pd
 import requests
 import streamlit as st
 
-from universe_engine_v0_1_13 import UniverseConfig, build_universe
+from universe_engine_v0_1_14 import UniverseConfig, build_universe
 
-st.set_page_config(page_title="Korea OHLCV CSV v1.0.13 STOCK + INDEX + UNIVERSE + BATCH", page_icon="📈")
+st.set_page_config(page_title="Korea OHLCV CSV v1.0.14 STOCK + INDEX + UNIVERSE + BATCH", page_icon="📈")
 
 H = {
     "User-Agent": "Mozilla/5.0",
@@ -692,13 +692,15 @@ def make_batch_bundle(order_slice, start_date, end_date, login_id="", login_pw="
     files[f"{filename_time_prefix()}_batch_manifest.csv"] = manifest_bytes
 
     audit_obj = {
-        "app_build": "APP_v1.0.13",
-        "engine_build": "UNIVERSE_ENGINE_v0.1.13",
+        "app_build": "APP_v1.0.14",
+        "engine_build": "UNIVERSE_ENGINE_v0.1.14",
         "batch_start_order": int(order_slice["development_selection_order"].min()),
         "batch_end_order": int(order_slice["development_selection_order"].max()),
         "requested_start": str(start_date),
         "requested_end": str(end_date),
         "stock_count": int(len(order_slice)),
+        "login_id_present_at_batch_function": bool(login_id),
+        "login_pw_present_at_batch_function": bool(login_pw),
         "batch_fetch_path": "fetch_krx_direct_raw_isolated->fetch_krx_direct_raw_diagnostic",
         "future_outcomes_opened": False,
         "stocks": audit_rows,
@@ -1160,13 +1162,13 @@ def make_csv_filename(name, df, partial=False):
     return f"{filename_time_prefix()}_{safe_filename_piece(name)}_{start}_{end}_생성{created}{suffix}.csv"
 
 
-st.title("Korea OHLCV CSV v1.0.13 STOCK + INDEX + UNIVERSE + BATCH")
+st.title("Korea OHLCV CSV v1.0.14 STOCK + INDEX + UNIVERSE + BATCH")
 st.caption(
     "개별주식 KRX DIRECT RAW + KOSPI/KOSDAQ 지수(FDR) + "
     "Track 02 Development Universe · 원본 보존 · outcome-blind"
 )
 
-st.caption("BUILD: APP_v1.0.13 / UNIVERSE_ENGINE_v0.1.13 / BATCH_OHLCV_v0.5")
+st.caption("BUILD: APP_v1.0.14 / UNIVERSE_ENGINE_v0.1.14 / BATCH_OHLCV_v0.6")
 
 data_kind = st.radio(
     "수집 대상",
@@ -1353,10 +1355,11 @@ elif data_kind == "Development Batch OHLCV":
             key="batch_end",
         )
 
-    with st.expander("KRX 로그인 (선택 사항 — 익명 수집 실패 시만 사용)", expanded=False):
-        st.caption("ID/비밀번호는 메모리에서만 사용하며 ZIP/로그에 저장하지 않습니다.")
-        batch_krx_id = st.text_input("KRX ID", value="", key="batch_krx_id")
-        batch_krx_pw = st.text_input("KRX 비밀번호", value="", type="password", key="batch_krx_pw")
+    st.info(
+        "Batch KRX 수집은 현재 인증 세션이 필요합니다. "
+        "ID/PW는 아래 실행 폼에서 입력하고 같은 폼의 실행 버튼을 누릅니다. "
+        "값 자체는 ZIP/audit에 저장하지 않습니다."
+    )
 
     if uploaded is not None:
         try:
@@ -1387,10 +1390,36 @@ elif data_kind == "Development Batch OHLCV":
             ] if c in sl.columns]
             st.dataframe(sl[show], use_container_width=True, hide_index=True)
 
-            if st.button("Development Batch OHLCV 만들기", type="primary", use_container_width=True):
+            with st.form("development_batch_run_form", clear_on_submit=False):
+                st.caption(
+                    "KRX 로그인값과 실행 버튼을 같은 form에 넣어 Streamlit rerun으로 "
+                    "ID/PW가 사라지는 문제를 막습니다."
+                )
+                batch_krx_id = st.text_input("KRX ID", value="", key="batch_krx_id_form")
+                batch_krx_pw = st.text_input(
+                    "KRX 비밀번호", value="", type="password", key="batch_krx_pw_form"
+                )
+                st.caption("ID/PW 입력 여부만 검사하며 실제 값은 audit에 기록하지 않습니다.")
+                run_batch = st.form_submit_button(
+                    "Development Batch OHLCV 만들기",
+                    type="primary",
+                    use_container_width=True,
+                )
+
+            if run_batch:
                 if batch_start > batch_end:
                     st.error("OHLCV 시작일/종료일을 확인하세요.")
                     st.stop()
+
+                if not batch_krx_id or not batch_krx_pw:
+                    st.error(
+                        "KRX ID와 비밀번호가 Batch 함수에 전달되기 전에 비어 있습니다. "
+                        "두 칸 모두 입력한 뒤 같은 폼의 실행 버튼을 눌러주세요."
+                    )
+                    st.stop()
+
+                # Safe UI confirmation: never expose credential values or lengths.
+                st.success("KRX ID/PW 입력 감지: YES / YES")
 
                 prog = st.progress(0, text="배치 준비 중")
                 def pcb(p, msg):
