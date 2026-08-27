@@ -1,20 +1,12 @@
 {
-  "version": "1.0.2",
+  "version": "1.0.3",
   "date": "2026-08-27",
-  "observed_user_test": {
-    "reference_business_day_resolved": "20260827",
-    "liquidity_days": 20,
-    "pykrx_version": "1.2.8",
-    "snapshot_errors": [
-      "KOSPI KeyError: 종가",
-      "KOSDAQ KeyError: 종가"
-    ]
-  },
+  "observed_error_v102": "snapshot_cap KeyError: expected Korean columns absent",
   "fix": {
-    "market_cap_snapshot": "pykrx get_market_cap_by_ticker",
-    "sector_primary": "pykrx sector API, non-fatal",
-    "sector_fallback": "FDR KRX listing only when ref_date == today",
-    "historical_sector_lookahead": "prohibited; use SECTOR_UNKNOWN"
+    "current_day_snapshot_primary": "FDR StockListing('KRX')",
+    "historical_current_listing_use": "FORBIDDEN",
+    "schema_normalization": "Korean/English aliases",
+    "liquidity_schema": "dynamic trading-value column"
   },
   "compile": "PASS",
   "future_response_outcomes_opened": false,

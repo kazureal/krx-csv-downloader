@@ -1,4 +1,4 @@
-# HRF Track 02 — Point-in-Time Development Universe Engine v0.1.2
+# HRF Track 02 — Point-in-Time Development Universe Engine v0.1.3
 # Outcome-blind. Does not read H15 / MFE / MAE / tail outcomes.
 
 from __future__ import annotations
@@ -122,22 +122,44 @@ def _normalize_sector_frame(df: pd.DataFrame, market: str) -> pd.DataFrame:
 
 
 def _normalize_cap_frame(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Schema-flexible market snapshot normalizer.
+
+    pykrx versions/endpoints can expose either Korean or English-like column names,
+    and some versions return only a subset. Never select a fixed set of Korean
+    columns before checking what is actually present.
+    """
+    cols = [
+        "ticker", "close_capapi", "volume", "trading_value",
+        "listed_shares", "market_cap_capapi"
+    ]
     if df is None or df.empty:
-        return pd.DataFrame(columns=["ticker", "volume", "trading_value", "listed_shares", "market_cap_capapi"])
+        return pd.DataFrame(columns=cols)
+
     x = df.copy().reset_index()
-    x = x.rename(columns={
-        x.columns[0]: "ticker",
-        "거래량": "volume",
-        "거래대금": "trading_value",
-        "상장주식수": "listed_shares",
-        "시가총액": "market_cap_capapi",
-        "종가": "close_capapi",
-    })
-    x["ticker"] = x["ticker"].astype(str).str.zfill(6)
-    for c in ["volume", "trading_value", "listed_shares", "market_cap_capapi", "close_capapi"]:
-        if c in x:
-            x[c] = pd.to_numeric(x[c], errors="coerce")
-    return x
+    first = x.columns[0]
+    x = x.rename(columns={first: "ticker"})
+
+    aliases = {
+        "close_capapi": ["종가", "Close", "close"],
+        "volume": ["거래량", "Volume", "volume"],
+        "trading_value": ["거래대금", "Amount", "TradingValue", "Value", "amount", "trading_value"],
+        "listed_shares": ["상장주식수", "Stocks", "Shares", "listed_shares"],
+        "market_cap_capapi": ["시가총액", "Marcap", "MarketCap", "market_cap", "marcap"],
+    }
+
+    for target, choices in aliases.items():
+        found = next((c for c in choices if c in x.columns), None)
+        if found is not None and found != target:
+            x = x.rename(columns={found: target})
+        if target not in x.columns:
+            x[target] = np.nan
+
+    x["ticker"] = x["ticker"].astype(str).str.extract(r"(\d{6})", expand=False).fillna(x["ticker"].astype(str)).str.zfill(6)
+    for c in cols[1:]:
+        x[c] = pd.to_numeric(x[c], errors="coerce")
+
+    return x[cols].copy()
 
 
 def get_prior_business_days(ref_yyyymmdd: str, lookback_sessions: int, calendar_days: int = 80) -> list[str]:
@@ -154,6 +176,45 @@ def get_prior_business_days(ref_yyyymmdd: str, lookback_sessions: int, calendar_
             "business_day_calendar_days를 늘리거나 FDR 상태를 확인하세요."
         )
     return days[-lookback_sessions:]
+
+
+
+def _fdr_current_snapshot(markets: tuple[str, ...]) -> pd.DataFrame:
+    """
+    Current-date only fallback/primary snapshot using FinanceDataReader StockListing('KRX').
+    This must NEVER be used for a historical reference date.
+    """
+    fdr = _import_fdr()
+    listing = fdr.StockListing("KRX")
+    if listing is None or listing.empty:
+        return pd.DataFrame()
+
+    x = listing.copy()
+    aliases = {
+        "ticker": ["Code", "Symbol", "code"],
+        "name": ["Name", "name"],
+        "market": ["Market", "market"],
+        "sector": ["Sector", "Industry", "sector"],
+        "close_capapi": ["Close", "close"],
+        "volume": ["Volume", "volume"],
+        "trading_value": ["Amount", "TradingValue", "Value", "amount"],
+        "market_cap_capapi": ["Marcap", "MarketCap", "market_cap"],
+        "listed_shares": ["Stocks", "Shares", "listed_shares"],
+    }
+    out = pd.DataFrame(index=x.index)
+    for target, choices in aliases.items():
+        found = next((c for c in choices if c in x.columns), None)
+        out[target] = x[found] if found is not None else np.nan
+
+    out["ticker"] = out["ticker"].astype(str).str.extract(r"(\d{6})", expand=False).fillna(out["ticker"].astype(str)).str.zfill(6)
+    out["market"] = out["market"].astype(str).str.upper()
+    out = out[out["market"].isin(markets)].copy()
+
+    for c in ["close_capapi", "volume", "trading_value", "market_cap_capapi", "listed_shares"]:
+        out[c] = pd.to_numeric(out[c], errors="coerce")
+    out["name"] = out["name"].fillna("").astype(str)
+    out["sector"] = out["sector"].fillna("SECTOR_UNKNOWN").astype(str)
+    return out.reset_index(drop=True)
 
 
 def fetch_snapshot(ref_date, config: UniverseConfig = UniverseConfig(), progress=None):
@@ -174,23 +235,39 @@ def fetch_snapshot(ref_date, config: UniverseConfig = UniverseConfig(), progress
         "outcomes_opened": False,
     }
 
-    # Point-in-time market-cap snapshot.
-    # v0.1.2: do NOT make sector classification a hard dependency.
-    # pykrx 1.2.8 can raise KeyError('종가') inside get_market_sector_classifications().
-    # We first build the universe from market-cap/ticker data, then enrich sector separately.
-    for market in config.markets:
+    # Point-in-time market snapshot.
+    # v0.1.3: for the current reference date, use FDR KRX listing first because
+    # the deployed pykrx 1.2.8 snapshot APIs returned schema-incompatible frames.
+    # For historical reference dates, current FDR listing is forbidden.
+    ref_ts = pd.Timestamp(ref)
+    today_ts = pd.Timestamp(date.today().strftime("%Y%m%d"))
+
+    if ref_ts.normalize() == today_ts.normalize():
         try:
-            cap = stock.get_market_cap_by_ticker(ref, market)
-            b = _normalize_cap_frame(cap)
-            if b.empty:
-                raise RuntimeError("empty market-cap snapshot")
-            b["market"] = market
-            frames.append(b)
+            fdr_snap = _fdr_current_snapshot(config.markets)
+            if fdr_snap is not None and not fdr_snap.empty:
+                frames.append(fdr_snap)
+                diagnostics["snapshot_source"] = "FDR_CURRENT_KRX_LISTING_SAME_DAY"
         except Exception as ex:
             diagnostics["errors"].append(
-                {"stage": "snapshot_cap", "market": market, "error": f"{type(ex).__name__}: {ex}"}
+                {"stage": "snapshot_fdr_current", "error": f"{type(ex).__name__}: {ex}"}
             )
 
+    if not frames:
+        for market in config.markets:
+            try:
+                cap = stock.get_market_cap_by_ticker(ref, market)
+                b = _normalize_cap_frame(cap)
+                if b.empty:
+                    raise RuntimeError("empty market-cap snapshot")
+                b["market"] = market
+                b["name"] = ""
+                b["sector"] = "SECTOR_UNKNOWN"
+                frames.append(b)
+            except Exception as ex:
+                diagnostics["errors"].append(
+                    {"stage": "snapshot_cap", "market": market, "error": f"{type(ex).__name__}: {ex}"}
+                )
     if not frames:
         return pd.DataFrame(), diagnostics
 
@@ -198,70 +275,44 @@ def fetch_snapshot(ref_date, config: UniverseConfig = UniverseConfig(), progress
     snap = snap.drop_duplicates(["market", "ticker"], keep="first")
 
     # Name + sector enrichment.
-    # Primary attempt: pykrx sector API.
-    # If pykrx sector API fails (observed on pykrx 1.2.8 with KeyError '종가'),
-    # use FinanceDataReader current KRX listing ONLY when ref date is the current date.
-    sector_pieces = []
-    for market in config.markets:
-        try:
-            sec = stock.get_market_sector_classifications(ref, market)
-            a = _normalize_sector_frame(sec, market)
-            if not a.empty:
-                sector_pieces.append(a[["ticker", "name", "sector", "market"]])
-        except Exception as ex:
-            diagnostics["errors"].append(
-                {"stage": "sector_primary", "market": market, "error": f"{type(ex).__name__}: {ex}"}
-            )
-
-    if sector_pieces:
-        sec_all = pd.concat(sector_pieces, ignore_index=True).drop_duplicates(["market", "ticker"])
-        snap = snap.merge(sec_all, on=["market", "ticker"], how="left")
-        diagnostics["sector_source"] = "PYKRX_POINT_IN_TIME"
-    else:
-        snap["name"] = ""
-        snap["sector"] = np.nan
-        diagnostics["sector_source"] = "UNAVAILABLE"
-
-        ref_ts = pd.Timestamp(ref)
-        today_ts = pd.Timestamp(date.today().strftime("%Y%m%d"))
-        if ref_ts.normalize() == today_ts.normalize():
+    # If FDR current listing already supplied these fields, keep them.
+    # Otherwise try pykrx sector metadata as a non-fatal enrichment.
+    if diagnostics.get("snapshot_source") != "FDR_CURRENT_KRX_LISTING_SAME_DAY":
+        sector_pieces = []
+        for market in config.markets:
             try:
-                fdr = _import_fdr()
-                listing = fdr.StockListing("KRX")
-                if listing is not None and not listing.empty:
-                    lx = listing.copy()
-                    # Common FDR schemas: Code, Name, Market, Sector / Industry
-                    code_col = "Code" if "Code" in lx.columns else ("Symbol" if "Symbol" in lx.columns else None)
-                    name_col = "Name" if "Name" in lx.columns else None
-                    market_col = "Market" if "Market" in lx.columns else None
-                    sector_col = "Sector" if "Sector" in lx.columns else ("Industry" if "Industry" in lx.columns else None)
-                    if code_col:
-                        lx["ticker"] = lx[code_col].astype(str).str.zfill(6)
-                        if market_col:
-                            lx["market"] = lx[market_col].astype(str).str.upper()
-                        else:
-                            lx["market"] = ""
-                        lx["name_fdr"] = lx[name_col].astype(str) if name_col else ""
-                        lx["sector_fdr"] = lx[sector_col].astype(str) if sector_col else "SECTOR_UNKNOWN"
-                        lx = lx[["ticker", "market", "name_fdr", "sector_fdr"]].drop_duplicates(["ticker", "market"])
-                        snap = snap.merge(lx, on=["ticker", "market"], how="left")
-                        snap["name"] = snap["name_fdr"].fillna("")
-                        snap["sector"] = snap["sector_fdr"].replace({"nan": np.nan})
-                        snap = snap.drop(columns=["name_fdr", "sector_fdr"])
-                        diagnostics["sector_source"] = "FDR_CURRENT_LISTING_SAME_DAY_FALLBACK"
+                sec = stock.get_market_sector_classifications(ref, market)
+                a = _normalize_sector_frame(sec, market)
+                if not a.empty:
+                    sector_pieces.append(a[["ticker", "name", "sector", "market"]])
             except Exception as ex:
                 diagnostics["errors"].append(
-                    {"stage": "sector_fallback_fdr", "error": f"{type(ex).__name__}: {ex}"}
+                    {"stage": "sector_primary", "market": market, "error": f"{type(ex).__name__}: {ex}"}
                 )
 
-    # Final name fallback: ticker string if name unavailable.
+        if sector_pieces:
+            sec_all = pd.concat(sector_pieces, ignore_index=True).drop_duplicates(["market", "ticker"])
+            snap = snap.merge(sec_all, on=["market", "ticker"], how="left", suffixes=("", "_sec"))
+            if "name_sec" in snap.columns:
+                snap["name"] = snap["name_sec"].fillna(snap.get("name", ""))
+                snap = snap.drop(columns=["name_sec"])
+            if "sector_sec" in snap.columns:
+                snap["sector"] = snap["sector_sec"].fillna(snap.get("sector", "SECTOR_UNKNOWN"))
+                snap = snap.drop(columns=["sector_sec"])
+            diagnostics["sector_source"] = "PYKRX_POINT_IN_TIME"
+        else:
+            diagnostics["sector_source"] = "UNAVAILABLE"
+    else:
+        diagnostics["sector_source"] = "FDR_CURRENT_KRX_LISTING_SAME_DAY"
+
     if "name" not in snap:
         snap["name"] = ""
-    snap["name"] = snap["name"].fillna("")
+    snap["name"] = snap["name"].fillna("").astype(str)
     snap.loc[snap["name"].eq(""), "name"] = snap.loc[snap["name"].eq(""), "ticker"]
+
     if "sector" not in snap:
         snap["sector"] = "SECTOR_UNKNOWN"
-    snap["sector"] = snap["sector"].fillna("SECTOR_UNKNOWN")
+    snap["sector"] = snap["sector"].fillna("SECTOR_UNKNOWN").astype(str)
 
     # Prior 20 valid market sessions' daily trading value. One request per date/market.
     tv_records = []
@@ -277,10 +328,19 @@ def fetch_snapshot(ref_date, config: UniverseConfig = UniverseConfig(), progress
                 if q is None or q.empty:
                     continue
                 q = q.copy().reset_index()
-                q = q.rename(columns={q.columns[0]: "ticker", "거래대금": "trading_value_day"})
-                if "trading_value_day" not in q:
+                q = q.rename(columns={q.columns[0]: "ticker"})
+                value_col = next(
+                    (c for c in ["거래대금", "Amount", "TradingValue", "Value", "amount"] if c in q.columns),
+                    None,
+                )
+                if value_col is None:
+                    diagnostics["errors"].append(
+                        {"stage": "liquidity_schema", "market": market, "date": d,
+                         "error": f"no trading-value column; columns={list(q.columns)}"}
+                    )
                     continue
-                q["ticker"] = q["ticker"].astype(str).str.zfill(6)
+                q = q.rename(columns={value_col: "trading_value_day"})
+                q["ticker"] = q["ticker"].astype(str).str.extract(r"(\d{6})", expand=False).fillna(q["ticker"].astype(str)).str.zfill(6)
                 q["trading_value_day"] = pd.to_numeric(q["trading_value_day"], errors="coerce")
                 q["market"] = market
                 q["date"] = d
