@@ -13,7 +13,7 @@ import streamlit as st
 
 from universe_engine_v0_1 import UniverseConfig, build_universe
 
-st.set_page_config(page_title="Korea OHLCV CSV v1.0.0 STOCK + INDEX + UNIVERSE", page_icon="📈")
+st.set_page_config(page_title="Korea OHLCV CSV v1.0.1 STOCK + INDEX + UNIVERSE", page_icon="📈")
 
 H = {
     "User-Agent": "Mozilla/5.0",
@@ -751,7 +751,7 @@ def make_csv_filename(name, df, partial=False):
     return f"{safe_filename_piece(name)}_{start}_{end}_생성{created}{suffix}.csv"
 
 
-st.title("Korea OHLCV CSV v1.0.0 STOCK + INDEX + UNIVERSE")
+st.title("Korea OHLCV CSV v1.0.1 STOCK + INDEX + UNIVERSE")
 st.caption(
     "개별주식 KRX DIRECT RAW + KOSPI/KOSDAQ 지수(FDR) + "
     "Track 02 Development Universe · 원본 보존 · outcome-blind"

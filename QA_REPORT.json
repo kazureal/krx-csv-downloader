@@ -1,14 +1,19 @@
 {
-  "version": "1.0.0",
+  "version": "1.0.1",
   "date": "2026-08-27",
+  "trigger": "Real Streamlit/iPhone Universe test",
+  "observed_error": "IndexError: index -1 is out of bounds for axis 0 with size 0",
+  "fix": {
+    "reference_business_day": "FDR KS11 actual trading calendar first",
+    "prior_20_sessions": "FDR KS11 actual trading calendar",
+    "fallback": "pykrx KOSPI market-cap backward probe",
+    "guessed_weekdays": false
+  },
   "checks": {
     "compile_app": true,
     "compile_universe_engine": true,
-    "stock_index_filename_format": "NAME_ACTUALSTART_ACTUALEND_CREATEDATE",
-    "universe_mode_present": true,
-    "v0.9.9_FDR_INDEX_path_preserved": true,
-    "KRX_DIRECT_RAW_path_preserved": true,
-    "universe_future_outcome_data_access": false
+    "stock_index_paths_preserved": true,
+    "future_response_outcomes_opened": false
   },
-  "note": "Universe code contains warning text mentioning H15/MFE/MAE, but no future-response dataset or response column is read. Syntax/compile verified; live Streamlit/KRX execution must be checked in deployment."
+  "live_note": "Stock and KOSPI CSV downloads were user-verified. Universe v1.0.1 requires re-test in Streamlit."
 }

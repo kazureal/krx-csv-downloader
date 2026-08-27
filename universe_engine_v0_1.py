@@ -1,4 +1,4 @@
-# HRF Track 02 — Point-in-Time Development Universe Engine v0.1
+# HRF Track 02 — Point-in-Time Development Universe Engine v0.1.1
 # Outcome-blind. Does not read H15 / MFE / MAE / tail outcomes.
 
 from __future__ import annotations
@@ -43,9 +43,60 @@ def _to_yyyymmdd(x) -> str:
     return pd.Timestamp(x).strftime("%Y%m%d")
 
 
+def _import_fdr():
+    try:
+        import FinanceDataReader as fdr
+    except Exception as ex:
+        raise RuntimeError(
+            "FinanceDataReader가 필요합니다. requirements.txt 설치 후 다시 실행하세요. "
+            f"원인: {type(ex).__name__}: {ex}"
+        ) from ex
+    return fdr
+
+
+def _fdr_kospi_calendar(ref_date, calendar_days: int = 120) -> list[str]:
+    """
+    Use the already-approved FDR KOSPI index path only as a trading-calendar source.
+    No future response outcome is accessed.
+    """
+    fdr = _import_fdr()
+    end = pd.Timestamp(ref_date)
+    start = end - pd.Timedelta(days=calendar_days)
+    df = fdr.DataReader("KS11", start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"))
+    if df is None or df.empty:
+        return []
+    idx = pd.to_datetime(df.index, errors="coerce")
+    idx = idx[(~pd.isna(idx)) & (idx <= end)]
+    return [pd.Timestamp(x).strftime("%Y%m%d") for x in idx]
+
+
 def resolve_reference_business_day(ref_date) -> str:
+    """
+    v0.1.1 fix:
+    pykrx.get_nearest_business_day_in_a_week can throw IndexError when its
+    internal date query returns an empty array. Prefer the FDR KOSPI calendar,
+    which is already used successfully by this app for market-index dates.
+    Fall back to direct pykrx market-cap probes, never to a guessed weekday.
+    """
+    days = _fdr_kospi_calendar(ref_date, calendar_days=20)
+    if days:
+        return days[-1]
+
     stock, _ = _import_pykrx()
-    return stock.get_nearest_business_day_in_a_week(_to_yyyymmdd(ref_date), prev=True)
+    end = pd.Timestamp(ref_date)
+    errors = []
+    for back in range(0, 15):
+        d = (end - pd.Timedelta(days=back)).strftime("%Y%m%d")
+        try:
+            q = stock.get_market_cap_by_ticker(d, "KOSPI")
+            if q is not None and not q.empty:
+                return d
+        except Exception as ex:
+            errors.append(f"{d}:{type(ex).__name__}")
+    raise RuntimeError(
+        "기준 영업일을 확인하지 못했습니다. FDR KOSPI calendar와 pykrx KOSPI "
+        f"market-cap probe가 모두 실패했습니다. recent={errors[:5]}"
+    )
 
 
 def _normalize_sector_frame(df: pd.DataFrame, market: str) -> pd.DataFrame:
@@ -90,20 +141,19 @@ def _normalize_cap_frame(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def get_prior_business_days(ref_yyyymmdd: str, lookback_sessions: int, calendar_days: int = 80) -> list[str]:
-    stock, _ = _import_pykrx()
+    """
+    Obtain actual KOSPI trading dates from FDR instead of pykrx helper
+    get_previous_business_days, avoiding the same empty-index failure mode.
+    """
     end = pd.Timestamp(ref_yyyymmdd)
-    start = end - pd.Timedelta(days=calendar_days)
-    days = stock.get_previous_business_days(
-        fromdate=start.strftime("%Y%m%d"),
-        todate=end.strftime("%Y%m%d"),
-    )
-    days = [pd.Timestamp(x) for x in days if pd.Timestamp(x) <= end]
+    days = _fdr_kospi_calendar(end, calendar_days=max(calendar_days, 120))
+    days = [d for d in days if d <= ref_yyyymmdd]
     if len(days) < lookback_sessions:
         raise RuntimeError(
-            f"영업일 {lookback_sessions}개가 필요하지만 {len(days)}개만 확보했습니다. "
-            "business_day_calendar_days를 늘리세요."
+            f"KOSPI 실제 거래일 {lookback_sessions}개가 필요하지만 {len(days)}개만 확보했습니다. "
+            "business_day_calendar_days를 늘리거나 FDR 상태를 확인하세요."
         )
-    return [d.strftime("%Y%m%d") for d in days[-lookback_sessions:]]
+    return days[-lookback_sessions:]
 
 
 def fetch_snapshot(ref_date, config: UniverseConfig = UniverseConfig(), progress=None):

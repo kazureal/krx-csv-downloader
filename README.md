@@ -1,4 +1,4 @@
-# Korea OHLCV CSV v1.0.0 — STOCK + INDEX + UNIVERSE
+# Korea OHLCV CSV v1.0.1 — STOCK + INDEX + UNIVERSE
 
 ## 이번 업데이트
 기존 v0.9.9의 동작을 유지하면서 아래를 추가했습니다.
@@ -51,3 +51,19 @@ GitHub의 기존 `app.py`를 이 패키지의 `app.py`로 교체하고,
 ## 중요
 - Universe 모드는 H15/MFE/MAE 등 미래 outcome을 읽지 않습니다.
 - 우선주 판별은 현재 보수적 이름패턴 1차 필터이며, final universe freeze 전 KRX security-class cross-check가 필요합니다.
+
+
+## v1.0.1 Universe hotfix
+2026-08-27 실제 iPhone/Streamlit 테스트에서 Development Universe 생성 시
+`IndexError: index -1 is out of bounds for axis 0 with size 0`가 발생했습니다.
+
+원인 후보를 `pykrx.get_nearest_business_day_in_a_week()`의 빈 응답 처리로 좁혔고,
+다음처럼 수정했습니다.
+
+- 기준 영업일: 기존 앱에서 실제 검증된 FDR KOSPI(`KS11`) 거래일 calendar 사용
+- 직전 20거래일: FDR KOSPI 실제 거래일 사용
+- FDR calendar 실패 시에만 pykrx KOSPI 시총 데이터를 날짜별 backward probe
+- 임의 평일 추정은 하지 않음
+- Universe snapshot/sector/market-cap/trading-value 본체는 기존 pykrx 구조 유지
+
+이 수정은 future H15/MFE/MAE outcome을 사용하지 않습니다.
