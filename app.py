@@ -11,9 +11,9 @@ import pandas as pd
 import requests
 import streamlit as st
 
-from universe_engine_v0_1 import UniverseConfig, build_universe
+from universe_engine_v0_1_5 import UniverseConfig, build_universe
 
-st.set_page_config(page_title="Korea OHLCV CSV v1.0.4 STOCK + INDEX + UNIVERSE", page_icon="📈")
+st.set_page_config(page_title="Korea OHLCV CSV v1.0.5 STOCK + INDEX + UNIVERSE", page_icon="📈")
 
 H = {
     "User-Agent": "Mozilla/5.0",
@@ -751,11 +751,13 @@ def make_csv_filename(name, df, partial=False):
     return f"{safe_filename_piece(name)}_{start}_{end}_생성{created}{suffix}.csv"
 
 
-st.title("Korea OHLCV CSV v1.0.4 STOCK + INDEX + UNIVERSE")
+st.title("Korea OHLCV CSV v1.0.5 STOCK + INDEX + UNIVERSE")
 st.caption(
     "개별주식 KRX DIRECT RAW + KOSPI/KOSDAQ 지수(FDR) + "
     "Track 02 Development Universe · 원본 보존 · outcome-blind"
 )
+
+st.caption("BUILD: APP_v1.0.5 / UNIVERSE_ENGINE_v0.1.5")
 
 data_kind = st.radio(
     "수집 대상",
@@ -798,7 +800,11 @@ if data_kind == "Development Universe":
 
         prog.empty()
         if full.empty:
-            st.error("KRX/pykrx에서 universe를 가져오지 못했습니다.")
+            st.error("Universe snapshot을 가져오지 못했습니다.")
+            st.write(
+                f"실행 엔진: **{diag.get('engine_build', 'UNKNOWN/OLD ENGINE')}** / "
+                f"snapshot source: **{diag.get('snapshot_source', 'NONE')}**"
+            )
             st.json(diag)
             st.stop()
 

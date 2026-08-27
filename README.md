@@ -1,4 +1,4 @@
-# Korea OHLCV CSV v1.0.4 — STOCK + INDEX + UNIVERSE
+# Korea OHLCV CSV v1.0.5 — STOCK + INDEX + UNIVERSE
 
 ## 이번 업데이트
 기존 v0.9.9의 동작을 유지하면서 아래를 추가했습니다.
@@ -111,3 +111,20 @@ known-broken pykrx current market-cap path로 fallback된 것이 확인되었습
 - future outcome 봉인 유지
 
 재테스트 시 실패하더라도 audit의 `fdr_listing` 항목만 보면 다음 원인을 정확히 확정할 수 있습니다.
+
+
+## v1.0.5 deployment-cache fix
+v1.0.4 재테스트 화면에 `snapshot_cap` 오류가 계속 표시되었습니다.
+v1.0.4 current-date 코드라면 해당 stage가 나올 수 없으므로,
+Streamlit이 이전 `universe_engine_v0_1.py`를 계속 사용 중인 것으로 판단했습니다.
+
+이번 수정:
+- 엔진 파일명을 `universe_engine_v0_1_5.py`로 변경
+- `app.py` import도 새 파일명으로 변경
+- 화면에 `BUILD: APP_v1.0.5 / UNIVERSE_ENGINE_v0.1.5` 표시
+- audit JSON에 `engine_build=UNIVERSE_ENGINE_v0.1.5_20260827` 기록
+- 실패 화면에도 실제 실행 엔진과 snapshot source를 먼저 표시
+
+중요:
+GitHub에서 기존 `universe_engine_v0_1.py`는 삭제하고,
+새 `universe_engine_v0_1_5.py`를 올려야 합니다.

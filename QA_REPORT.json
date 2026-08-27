@@ -1,17 +1,13 @@
 {
-  "version": "1.0.4",
+  "version": "1.0.5",
   "date": "2026-08-27",
-  "observed_v103": "current FDR KRX aggregate listing did not yield usable rows; code fell back to broken pykrx current snapshot",
-  "fix": {
-    "current_snapshot": [
-      "FDR StockListing('KOSPI')",
-      "FDR StockListing('KOSDAQ')"
-    ],
-    "audit_actual_columns": true,
-    "silent_current_pykrx_fallback": false,
-    "historical_pykrx_fallback_only": true
+  "diagnosis": "User's v1.0.4 screenshot still reports stage=snapshot_cap. That stage is unreachable for a same-day reference in the v1.0.4 current-date path, so an older universe engine is almost certainly still deployed/imported.",
+  "deployment_fix": {
+    "new_engine_filename": "universe_engine_v0_1_5.py",
+    "old_engine_filename_must_be_deleted": "universe_engine_v0_1.py",
+    "visible_app_build": "APP_v1.0.5",
+    "visible_engine_build": "UNIVERSE_ENGINE_v0.1.5"
   },
   "compile": "PASS",
-  "future_response_outcomes_opened": false,
-  "live_retest_required": true
+  "future_response_outcomes_opened": false
 }
