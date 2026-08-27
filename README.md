@@ -1,4 +1,4 @@
-# Korea OHLCV CSV v1.0.6 — STOCK + INDEX + UNIVERSE
+# Korea OHLCV CSV v1.0.7 — STOCK + INDEX + UNIVERSE
 
 ## 이번 업데이트
 기존 v0.9.9의 동작을 유지하면서 아래를 추가했습니다.
@@ -152,3 +152,21 @@ H15/MFE/MAE 등 future outcome은 계속 봉인됩니다.
 화면에
 `BUILD: APP_v1.0.6 / UNIVERSE_ENGINE_v0.1.6`
 가 보여야 합니다.
+
+
+## v1.0.7 structural-universe fix
+v1.0.6은 snapshot 자체는 성공했지만 audit에서 40개 오류가 확인되었습니다.
+모두 pykrx 1.2.8의 전종목 일별 OHLCV 경로였고,
+결과적으로 `median_trading_value_20d`가 전부 NaN이었습니다.
+또한 가격 중심 FDR listing에는 Sector가 없어 모든 업종이 SECTOR_UNKNOWN이었습니다.
+
+수정:
+- `KOSPI-DESC` / `KOSDAQ-DESC`를 같은 날 descriptive metadata로 merge
+- Sector / Industry / ListingDate 확보
+- DESC membership을 current-date common-stock company cross-check로 사용
+- 우선주/특수종목 이름패턴 필터도 유지
+- broken pykrx all-market 20일 liquidity 호출 40개를 제거
+- 20일 중위 거래대금은 선정된 각 종목의 검증 OHLCV에서 계산하도록 명시적으로 deferred
+- current-day 거래대금으로 20일 median을 대체하지 않음
+- selection order는 market + sector + market-cap bucket만 사용
+- H15/MFE/MAE future outcome 봉인 유지

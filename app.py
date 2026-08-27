@@ -11,9 +11,9 @@ import pandas as pd
 import requests
 import streamlit as st
 
-from universe_engine_v0_1_6 import UniverseConfig, build_universe
+from universe_engine_v0_1_7 import UniverseConfig, build_universe
 
-st.set_page_config(page_title="Korea OHLCV CSV v1.0.6 STOCK + INDEX + UNIVERSE", page_icon="📈")
+st.set_page_config(page_title="Korea OHLCV CSV v1.0.7 STOCK + INDEX + UNIVERSE", page_icon="📈")
 
 H = {
     "User-Agent": "Mozilla/5.0",
@@ -751,13 +751,13 @@ def make_csv_filename(name, df, partial=False):
     return f"{safe_filename_piece(name)}_{start}_{end}_생성{created}{suffix}.csv"
 
 
-st.title("Korea OHLCV CSV v1.0.6 STOCK + INDEX + UNIVERSE")
+st.title("Korea OHLCV CSV v1.0.7 STOCK + INDEX + UNIVERSE")
 st.caption(
     "개별주식 KRX DIRECT RAW + KOSPI/KOSDAQ 지수(FDR) + "
     "Track 02 Development Universe · 원본 보존 · outcome-blind"
 )
 
-st.caption("BUILD: APP_v1.0.6 / UNIVERSE_ENGINE_v0.1.6")
+st.caption("BUILD: APP_v1.0.7 / UNIVERSE_ENGINE_v0.1.7")
 
 data_kind = st.radio(
     "수집 대상",
@@ -816,11 +816,16 @@ if data_kind == "Development Universe":
 
         if diag.get("errors"):
             st.warning(
-                f"수집 오류 {len(diag['errors'])}건. audit JSON을 확인하고 "
-                "불완전 데이터로 final selection을 진행하지 마세요."
+                f"수집 오류 {len(diag['errors'])}건. audit JSON을 확인하세요."
             )
             with st.expander("Universe 오류 로그"):
                 st.dataframe(pd.DataFrame(diag["errors"]), use_container_width=True, hide_index=True)
+
+        st.info(
+            "20거래일 중위 거래대금은 전종목 pykrx 경로 오류 때문에 여기서 만들지 않습니다. "
+            "선정 순서에는 유동성을 사용하지 않고, 각 후보의 검증 OHLCV를 수집할 때 "
+            "직전 20거래일 중위 거래대금을 계산한 뒤 Development eligibility를 판정합니다."
+        )
 
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("전체 snapshot", f"{len(full):,}")
