@@ -1,4 +1,4 @@
-# Korea OHLCV CSV v1.0.9 — STOCK + INDEX + UNIVERSE
+# Korea OHLCV CSV v1.0.10 — STOCK + INDEX + UNIVERSE
 
 ## 이번 업데이트
 기존 v0.9.9의 동작을 유지하면서 아래를 추가했습니다.
@@ -221,3 +221,24 @@ v1.0.7 audit 결과:
 - 기간: 2010-01-04 ~ 2026-08-27
 
 첫 배치가 정상인지 확인한 뒤 다음 배치로 진행합니다.
+
+
+## v1.0.10 Batch fetch-path reuse fix
+Batch 1 live test에서 10/10 종목이 JSONDecodeError로 실패했습니다.
+ISIN finder는 성공했으므로 Universe/selection 문제는 아니었습니다.
+
+수정 원칙:
+- 별도 `fetch_krx_direct_raw_batch()` 구현을 사용하지 않음
+- Batch가 기존 개별주식에서 실제 성공한 `fetch_krx_direct_raw()`를 그대로 호출
+- 종목 간 1초 operational pacing 추가
+- `valid_session`은 수집 후 structural audit column으로 계산
+- verified single-stock path가 OHLCV만 반환하므로 trading value는 추정하지 않음
+- `median_trading_value_20d`는 `PENDING_VERIFIED_TRADING_VALUE_SOURCE`
+- close*volume 같은 대체값 사용 금지
+- H15/MFE/MAE 등 future outcome은 계속 봉인
+
+첫 재시험:
+- 배치 크기 10
+- 배치 번호 1
+- 2010-01-04 ~ 2026-08-27
+- KRX 로그인 비움

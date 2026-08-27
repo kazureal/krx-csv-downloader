@@ -1,16 +1,20 @@
 {
-  "version": "1.0.9",
+  "version": "1.0.10",
   "date": "2026-08-27",
-  "feature": "Development Batch OHLCV",
-  "checks": {
-    "compile_app": true,
-    "compile_universe_engine": true,
-    "uses_universe_selection_order": true,
-    "batch_size_is_operational_not_research_gate": true,
-    "krx_direct_raw_adjStkPrc_1": true,
-    "optional_ACC_TRDVAL_preserved": true,
-    "median_trading_value_20_valid_sessions": true,
+  "observed_v109_live_failure": {
+    "stocks": 10,
+    "ohlcv_success": 0,
+    "isin_success": 10,
+    "chunk_failure": "JSONDecodeError"
+  },
+  "fix": {
+    "batch_fetch_function": "fetch_krx_direct_raw (exact verified single-stock path)",
+    "duplicate_batch_request_implementation_used": false,
+    "stock_to_stock_pacing_seconds": 1.0,
+    "trading_value_inferred": false,
+    "liquidity_status": "PENDING_VERIFIED_TRADING_VALUE_SOURCE",
     "future_outcomes_opened": false
   },
+  "compile": "PASS",
   "live_retest_required": true
 }
