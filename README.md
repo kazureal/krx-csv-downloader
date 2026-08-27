@@ -1,4 +1,4 @@
-# Korea OHLCV CSV v1.0.5 — STOCK + INDEX + UNIVERSE
+# Korea OHLCV CSV v1.0.6 — STOCK + INDEX + UNIVERSE
 
 ## 이번 업데이트
 기존 v0.9.9의 동작을 유지하면서 아래를 추가했습니다.
@@ -128,3 +128,27 @@ Streamlit이 이전 `universe_engine_v0_1.py`를 계속 사용 중인 것으로 
 중요:
 GitHub에서 기존 `universe_engine_v0_1.py`는 삭제하고,
 새 `universe_engine_v0_1_5.py`를 올려야 합니다.
+
+
+## v1.0.6 cast hotfix
+실제 v1.0.5 실행에서:
+`TypeError: cannot safely cast non-equivalent object to int64`
+가 발생했습니다.
+
+원인:
+- market-cap / liquidity bucket을 만들 때 rank percentile * bucket_count가
+  0.37, 1.82 같은 소수인데 pandas nullable `Int64`로 바로 cast함.
+- pandas가 non-integral float -> Int64 safe cast를 거부.
+
+수정:
+- bucket index를 `np.floor()`로 명시적으로 내림한 뒤
+- 0 ~ n-1 범위로 clip
+- 그 다음 `Int64`로 변환
+
+이 수정은 structural bucketing 코드만 변경하며
+H15/MFE/MAE 등 future outcome은 계속 봉인됩니다.
+
+배포 확인:
+화면에
+`BUILD: APP_v1.0.6 / UNIVERSE_ENGINE_v0.1.6`
+가 보여야 합니다.
