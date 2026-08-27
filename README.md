@@ -1,4 +1,4 @@
-# Korea OHLCV CSV v1.0.10 — STOCK + INDEX + UNIVERSE
+# Korea OHLCV CSV v1.0.11 — STOCK + INDEX + UNIVERSE
 
 ## 이번 업데이트
 기존 v0.9.9의 동작을 유지하면서 아래를 추가했습니다.
@@ -242,3 +242,20 @@ ISIN finder는 성공했으므로 Universe/selection 문제는 아니었습니�
 - 배치 번호 1
 - 2010-01-04 ~ 2026-08-27
 - KRX 로그인 비움
+
+
+## v1.0.11 Batch session-isolation fix
+Live evidence:
+- Batch path: 10/10 NO_DATA
+- Same symbol/range in single-stock mode: 060150, 4,099 rows, success
+
+Changes:
+- Batch uses the exact verified single-stock `fetch_krx_direct_raw()`
+- Every stock attempt gets a fresh Session through that function
+- Empty/failed stock: wait 8 seconds, retry whole stock once
+- After each stock: 8-second cooling before the next stock
+- First live validation default batch size = 2
+- If 2/2 passes, test 5, then 10
+- This changes only operational acquisition behavior, not selection order or research sample rules
+- Liquidity remains PENDING until a verified trading-value source is available
+- H15/MFE/MAE remain sealed

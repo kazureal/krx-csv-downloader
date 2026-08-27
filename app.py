@@ -12,9 +12,9 @@ import pandas as pd
 import requests
 import streamlit as st
 
-from universe_engine_v0_1_9 import UniverseConfig, build_universe
+from universe_engine_v0_1_11 import UniverseConfig, build_universe
 
-st.set_page_config(page_title="Korea OHLCV CSV v1.0.9 STOCK + INDEX + UNIVERSE + BATCH", page_icon="📈")
+st.set_page_config(page_title="Korea OHLCV CSV v1.0.11 STOCK + INDEX + UNIVERSE + BATCH", page_icon="📈")
 
 H = {
     "User-Agent": "Mozilla/5.0",
@@ -432,6 +432,48 @@ def fetch_krx_direct_raw_batch(code, start, end, login_id="", login_pw=""):
     return out, diag
 
 
+
+def fetch_krx_direct_raw_isolated(code, start, end, login_id="", login_pw="", retries=2, retry_wait=8.0):
+    """
+    Batch-only isolation wrapper around the exact verified single-stock fetcher.
+    Each attempt enters fetch_krx_direct_raw(), which creates its own fresh
+    requests.Session. Failed stock attempts are retried from scratch.
+    """
+    attempts = []
+    last_df = pd.DataFrame()
+    last_diag = {}
+
+    for attempt in range(1, int(retries) + 1):
+        t0 = time.time()
+        df, diag = fetch_krx_direct_raw(
+            code, start, end, login_id=login_id, login_pw=login_pw
+        )
+        attempts.append({
+            "attempt": attempt,
+            "rows": int(len(df)),
+            "elapsed_seconds": round(time.time() - t0, 3),
+            "diag": diag,
+        })
+        last_df, last_diag = df, diag
+        if not df.empty:
+            return df, {
+                "code": code,
+                "status": "OK",
+                "attempts": attempts,
+                "future_outcomes_opened": False,
+            }
+        if attempt < int(retries):
+            time.sleep(float(retry_wait))
+
+    return last_df, {
+        "code": code,
+        "status": "NO_DATA_AFTER_RETRY",
+        "attempts": attempts,
+        "last_diag": last_diag,
+        "future_outcomes_opened": False,
+    }
+
+
 def parse_universe_bundle(uploaded):
     raw = uploaded.getvalue()
     with zipfile.ZipFile(io.BytesIO(raw), "r") as zf:
@@ -476,25 +518,22 @@ def make_batch_bundle(order_slice, start_date, end_date, login_id="", login_pw="
             "selection_stratum": row.get("selection_stratum", ""),
             "status": "OK" if not df.empty else "NO_DATA",
             "rows": int(len(df)),
-            "valid_sessions": int(df["valid_session"].sum()) if not df.empty else 0,
+            "valid_sessions": 0,
             "actual_start": str(df["date"].min().date()) if not df.empty else "",
             "actual_end": str(df["date"].max().date()) if not df.empty else "",
-            "trading_value_nonnull": int(df["trading_value"].notna().sum()) if not df.empty else 0,
+            "trading_value_nonnull": 0,
             "median_trading_value_20d": None,
             "liquidity_status": "",
             "future_outcomes_opened": False,
         }
 
         if not df.empty:
-            valid = df[df["valid_session"]].copy()
-            tv = valid["trading_value"].dropna()
-            if len(tv) >= 20:
-                rec["median_trading_value_20d"] = float(tv.tail(20).median())
-                rec["liquidity_status"] = "READY_20_VALID_SESSIONS"
-            else:
-                rec["liquidity_status"] = "UNKNOWN_TRADING_VALUE_SUPPORT"
+            rec["liquidity_status"] = "PENDING_VERIFIED_TRADING_VALUE_SOURCE"
 
             export = df.copy()
+            finite_ohlc = export[["open", "high", "low", "close"]].notna().all(axis=1)
+            export["valid_session"] = (export["volume"] != 0) & finite_ohlc
+            rec["valid_sessions"] = int(export["valid_session"].sum())
             export["date"] = pd.to_datetime(export["date"]).dt.strftime("%Y-%m-%d")
             safe_name = safe_filename_piece(name)
             fn = f"{pos:04d}_{safe_name}_{ticker}_{rec['actual_start'].replace('-','')}_{rec['actual_end'].replace('-','')}.csv"
@@ -514,14 +553,15 @@ def make_batch_bundle(order_slice, start_date, end_date, login_id="", login_pw="
             "diag": diag,
         })
         results.append(rec)
+        time.sleep(8.0)  # operational cooling; not a research rule
 
     manifest_df = pd.DataFrame(results)
     manifest_bytes = manifest_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
     files["batch_manifest.csv"] = manifest_bytes
 
     audit_obj = {
-        "app_build": "APP_v1.0.9",
-        "engine_build": "UNIVERSE_ENGINE_v0.1.9",
+        "app_build": "APP_v1.0.11",
+        "engine_build": "UNIVERSE_ENGINE_v0.1.11",
         "batch_start_order": int(order_slice["development_selection_order"].min()),
         "batch_end_order": int(order_slice["development_selection_order"].max()),
         "requested_start": str(start_date),
@@ -982,13 +1022,13 @@ def make_csv_filename(name, df, partial=False):
     return f"{safe_filename_piece(name)}_{start}_{end}_생성{created}{suffix}.csv"
 
 
-st.title("Korea OHLCV CSV v1.0.9 STOCK + INDEX + UNIVERSE + BATCH")
+st.title("Korea OHLCV CSV v1.0.11 STOCK + INDEX + UNIVERSE + BATCH")
 st.caption(
     "개별주식 KRX DIRECT RAW + KOSPI/KOSDAQ 지수(FDR) + "
     "Track 02 Development Universe · 원본 보존 · outcome-blind"
 )
 
-st.caption("BUILD: APP_v1.0.9 / UNIVERSE_ENGINE_v0.1.9 / BATCH_OHLCV_v0.1")
+st.caption("BUILD: APP_v1.0.11 / UNIVERSE_ENGINE_v0.1.11 / BATCH_OHLCV_v0.3")
 
 data_kind = st.radio(
     "수집 대상",
@@ -1126,7 +1166,7 @@ if data_kind == "Development Universe":
 elif data_kind == "Development Batch OHLCV":
     st.info(
         "승인된 Universe Audit Bundle ZIP을 입력으로 사용해 deterministic selection order를 그대로 따라갑니다. "
-        "배치 크기는 서버 운영 단위일 뿐 연구 표본수 기준이 아닙니다."
+        "배치 크기는 서버 운영 단위일 뿐 연구 표본수 기준이 아닙니다. 첫 재시험은 2종목입니다."
     )
 
     uploaded = st.file_uploader(
@@ -1141,9 +1181,9 @@ elif data_kind == "Development Batch OHLCV":
             "운영 배치 크기",
             min_value=1,
             max_value=20,
-            value=10,
+            value=2,
             step=1,
-            help="서버 timeout 방지용 운영 단위. 연구 기준이 아닙니다.",
+            help="첫 검증은 2종목. 성공하면 5→10으로 확대. 연구 표본수 기준이 아닙니다.",
         )
     with c2:
         batch_no = st.number_input(
