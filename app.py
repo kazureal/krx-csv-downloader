@@ -7,7 +7,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-st.set_page_config(page_title="Korea OHLCV CSV v0.9.1 RAW DIAG", page_icon="📈")
+st.set_page_config(page_title="Korea OHLCV CSV v0.9.2 SOURCE TEST", page_icon="📈")
 
 H = {
     "User-Agent": "Mozilla/5.0",
@@ -183,6 +183,55 @@ def fetch_krx_raw(code, start, end):
     return out, diagnostics
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_fdr_candidate(code, start, end):
+    """
+    FinanceDataReader의 국내 종목 경로로 장기 OHLCV coverage를 확인한다.
+    중요: 이 경로는 '장기 이력 후보'이며 HRF 연구용 RAW로 자동 승인하지 않는다.
+    기존 검증 파일과 overlap 대조 후에만 연구 투입 여부를 판단한다.
+    """
+    try:
+        import FinanceDataReader as fdr
+    except Exception as ex:
+        raise RuntimeError("FinanceDataReader를 불러오지 못했습니다.") from ex
+
+    diag = {
+        "fdr_version": getattr(fdr, "__version__", "unknown"),
+        "code": code,
+        "requested_start": str(start),
+        "requested_end": str(end),
+    }
+    try:
+        df = fdr.DataReader(code, str(start), str(end))
+        diag["returned_rows"] = 0 if df is None else int(len(df))
+        diag["columns"] = [] if df is None else [str(c) for c in df.columns]
+        if df is None or df.empty:
+            diag["status"] = "FDR_EMPTY"
+            return _standardize(pd.DataFrame(), "FDR_CANDIDATE"), diag
+
+        x = df.reset_index()
+        # FDR common columns: Date/Open/High/Low/Close/Volume/Change
+        ren = {}
+        for c in x.columns:
+            lc = str(c).strip().lower()
+            if lc in ("date", "날짜"): ren[c] = "date"
+            elif lc in ("open", "시가"): ren[c] = "open"
+            elif lc in ("high", "고가"): ren[c] = "high"
+            elif lc in ("low", "저가"): ren[c] = "low"
+            elif lc in ("close", "종가"): ren[c] = "close"
+            elif lc in ("volume", "거래량"): ren[c] = "volume"
+        x = x.rename(columns=ren)
+        out = _standardize(x, "FDR_CANDIDATE")
+        diag["status"] = "FDR_OK" if not out.empty else "FDR_SCHEMA_EMPTY"
+        if not out.empty:
+            diag["actual_start"] = str(out.date.min().date())
+            diag["actual_end"] = str(out.date.max().date())
+        return out, diag
+    except Exception as ex:
+        diag["status"] = "FDR_ERROR"
+        diag["error"] = f"{type(ex).__name__}: {ex}"
+        return _standardize(pd.DataFrame(), "FDR_CANDIDATE"), diag
+
 def xmlroot(b):
     t = None
     for enc in ("euc-kr", "cp949", "utf-8"):
@@ -236,8 +285,8 @@ def add_audit_columns(df):
     return out
 
 
-st.title("Korea OHLCV CSV v0.9.1 RAW DIAG")
-st.caption("종목명/6자리 코드 · KRX 비수정 OHLCV 우선 · 원본 보존 · 이상치 표시 · 자동보정 없음 · 수집 진단 로그")
+st.title("Korea OHLCV CSV v0.9.2 SOURCE TEST")
+st.caption("KRX RAW 진단 + FDR/NAVER 장기이력 후보 · 원본 보존 · 자동보정 없음 · 연구 승인 전 소스 대조")
 
 q = st.text_input(
     "종목명 또는 6자리 종목코드",
@@ -252,7 +301,7 @@ with b:
 
 source_mode = st.radio(
     "데이터 소스",
-    ["KRX RAW (연구용 권장)", "NAVER FCHART (보조/대조용)"],
+    ["KRX RAW (진단)", "FDR 장기이력 후보 (대조 후 승인)", "NAVER FCHART (보조/대조용)"],
     horizontal=True,
 )
 
@@ -274,13 +323,34 @@ if st.button("OHLCV CSV 만들기", type="primary", use_container_width=True):
 
     try:
         diagnostics = None
+        fdr_diag = None
         if source_mode.startswith("KRX"):
             df, diagnostics = fetch_krx_raw(x["code"], s, e)
+        elif source_mode.startswith("FDR"):
+            df, fdr_diag = fetch_fdr_candidate(x["code"], s, e)
         else:
             df = fetch_naver_fchart(x["code"], s, e)
     except Exception as ex:
         st.error(f"수집 실패: {type(ex).__name__}: {ex}")
         st.stop()
+
+    if fdr_diag is not None:
+        st.write(f"종목 해석: **{x['name']} ({x['code']})**")
+        st.write(f"FinanceDataReader 버전: **{fdr_diag.get('fdr_version', 'unknown')}**")
+        st.write(
+            f"FDR 상태: **{fdr_diag.get('status','')}** / "
+            f"반환 행: **{fdr_diag.get('returned_rows', 0)}**"
+        )
+        if fdr_diag.get("actual_start"):
+            st.write(
+                f"실제 범위: **{fdr_diag.get('actual_start')} ~ {fdr_diag.get('actual_end')}**"
+            )
+        if fdr_diag.get("error"):
+            st.error(fdr_diag["error"])
+        st.warning(
+            "FDR 데이터는 현재 '장기이력 후보'입니다. "
+            "기존 검증 원자료와 중첩구간 OHLCV를 대조하기 전에는 HRF OOS에 사용하지 않습니다."
+        )
 
     if diagnostics is not None:
         st.write(f"종목 해석: **{x['name']} ({x['code']})**")
@@ -300,11 +370,12 @@ if st.button("OHLCV CSV 만들기", type="primary", use_container_width=True):
                 )
 
     if df.empty:
-        st.error("KRX RAW 데이터가 없습니다. 위 진단 로그의 status/error를 확인해 주세요.")
-        st.info(
-            "중요: adjusted=True probe는 '데이터 존재 여부' 진단용일 뿐이며, "
-            "CSV에는 사용하지 않습니다. HRF 연구용 원자료는 adjusted=False만 허용합니다."
-        )
+        st.error("선택한 소스에서 데이터가 없습니다. 위 진단 상태를 확인해 주세요.")
+        if source_mode.startswith("KRX"):
+            st.info(
+                "중요: adjusted=True probe는 '데이터 존재 여부' 진단용일 뿐이며, "
+                "CSV에는 사용하지 않습니다."
+            )
         st.stop()
 
     df = add_audit_columns(df)

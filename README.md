@@ -1,21 +1,18 @@
-# Korea OHLCV CSV v0.9.1 RAW DIAG
+# Korea OHLCV CSV v0.9.2 SOURCE TEST
 
-v0.9의 연구용 RAW 수집기를 유지하면서 KRX 수집 진단을 강화한 버전입니다.
+목적: SK하이닉스 000660의 2003-04-14 이후 장기 OHLCV 확보 가능성을 소스별로 진단합니다.
 
-## 변경점
-- `SK하이닉스`, `하이닉스`, `하이닉스반도체`, `에스케이하이닉스` → `000660` 인식 유지
-- KRX `adjusted=False` 연도 단위 분할 수집 유지
-- 각 연도별 `RAW_OK / RAW_EMPTY_ADJ_EXISTS / RAW_ERROR` 표시
-- pykrx 버전 표시
-- 오류 메시지/빈 응답 여부를 화면에서 바로 확인
-- `adjusted=True`는 오직 "그 기간 데이터가 존재하는지" 진단 probe에만 사용
-- 최종 CSV에는 절대 adjusted=True 데이터를 사용하지 않음
-- 원본 보존 / 자동보정 없음 / valid_session 표시 유지
+- KRX RAW: 기존 pykrx adjusted=False 진단 유지
+- FDR 장기이력 후보: FinanceDataReader 국내 종목 경로. 공식 프로젝트 문서는 000660 전체(1999~현재) 조회 예시를 제공함.
+- NAVER FCHART: 기존 보조/대조 경로 유지
+- FDR 결과는 자동으로 HRF 연구용 RAW로 승인하지 않음
+- CSV에 research_source_status=CANDIDATE_NOT_YET_APPROVED 표시
+- 원본 자동보정 없음
 
-## SK하이닉스 테스트
-종목: SK하이닉스
-시작일: 2003-04-14
-종료일: 오늘
-소스: KRX RAW (연구용 권장)
-
-데이터가 없더라도 'KRX 수집 진단 로그' 화면을 캡처하면 원인을 바로 구분할 수 있습니다.
+권장 테스트:
+1. 종목: SK하이닉스
+2. 시작: 2003-04-14
+3. 종료: 오늘
+4. 소스: FDR 장기이력 후보 (대조 후 승인)
+5. 실제 시작일/행 수 확인 후 CSV 다운로드
+6. 그 CSV를 ChatGPT에 올려 기존 2014-06-09~2026-08-27 파일과 OHLCV 전행 overlap 검증
