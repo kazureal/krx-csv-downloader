@@ -1,4 +1,4 @@
-# Korea OHLCV CSV v1.0.3 — STOCK + INDEX + UNIVERSE
+# Korea OHLCV CSV v1.0.4 — STOCK + INDEX + UNIVERSE
 
 ## 이번 업데이트
 기존 v0.9.9의 동작을 유지하면서 아래를 추가했습니다.
@@ -96,3 +96,18 @@ pykrx 1.2.8의 `get_market_sector_classifications()` 내부에서
 - future response outcome은 계속 봉인
 
 이 버전은 현재 날짜 기준 Development Universe 생성 성공 여부를 다시 확인하기 위한 hotfix입니다.
+
+
+## v1.0.4 Universe hotfix
+v1.0.3 실제 테스트에서도 current FDR `StockListing("KRX")`가 usable snapshot을 만들지 못해
+known-broken pykrx current market-cap path로 fallback된 것이 확인되었습니다.
+
+수정:
+- current-date Universe는 `StockListing("KOSPI")`와 `StockListing("KOSDAQ")`를 각각 호출
+- 각 listing의 실제 row 수와 column명을 `fdr_listing` audit에 기록
+- current-date FDR listing 실패 시 pykrx current snapshot으로 조용히 fallback하지 않음
+- 따라서 같은 pykrx schema error를 반복하지 않고 원인을 audit로 직접 노출
+- historical date에서만 pykrx historical fallback 허용
+- future outcome 봉인 유지
+
+재테스트 시 실패하더라도 audit의 `fdr_listing` 항목만 보면 다음 원인을 정확히 확정할 수 있습니다.

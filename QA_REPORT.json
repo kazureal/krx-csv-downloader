@@ -1,12 +1,15 @@
 {
-  "version": "1.0.3",
+  "version": "1.0.4",
   "date": "2026-08-27",
-  "observed_error_v102": "snapshot_cap KeyError: expected Korean columns absent",
+  "observed_v103": "current FDR KRX aggregate listing did not yield usable rows; code fell back to broken pykrx current snapshot",
   "fix": {
-    "current_day_snapshot_primary": "FDR StockListing('KRX')",
-    "historical_current_listing_use": "FORBIDDEN",
-    "schema_normalization": "Korean/English aliases",
-    "liquidity_schema": "dynamic trading-value column"
+    "current_snapshot": [
+      "FDR StockListing('KOSPI')",
+      "FDR StockListing('KOSDAQ')"
+    ],
+    "audit_actual_columns": true,
+    "silent_current_pykrx_fallback": false,
+    "historical_pykrx_fallback_only": true
   },
   "compile": "PASS",
   "future_response_outcomes_opened": false,

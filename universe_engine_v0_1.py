@@ -1,4 +1,4 @@
-# HRF Track 02 — Point-in-Time Development Universe Engine v0.1.3
+# HRF Track 02 — Point-in-Time Development Universe Engine v0.1.4
 # Outcome-blind. Does not read H15 / MFE / MAE / tail outcomes.
 
 from __future__ import annotations
@@ -179,42 +179,81 @@ def get_prior_business_days(ref_yyyymmdd: str, lookback_sessions: int, calendar_
 
 
 
-def _fdr_current_snapshot(markets: tuple[str, ...]) -> pd.DataFrame:
-    """
-    Current-date only fallback/primary snapshot using FinanceDataReader StockListing('KRX').
-    This must NEVER be used for a historical reference date.
-    """
-    fdr = _import_fdr()
-    listing = fdr.StockListing("KRX")
-    if listing is None or listing.empty:
+def _normalize_fdr_listing_frame(x: pd.DataFrame, forced_market: str) -> pd.DataFrame:
+    if x is None or x.empty:
         return pd.DataFrame()
 
-    x = listing.copy()
     aliases = {
-        "ticker": ["Code", "Symbol", "code"],
-        "name": ["Name", "name"],
-        "market": ["Market", "market"],
-        "sector": ["Sector", "Industry", "sector"],
-        "close_capapi": ["Close", "close"],
-        "volume": ["Volume", "volume"],
-        "trading_value": ["Amount", "TradingValue", "Value", "amount"],
-        "market_cap_capapi": ["Marcap", "MarketCap", "market_cap"],
-        "listed_shares": ["Stocks", "Shares", "listed_shares"],
+        "ticker": ["Code", "Symbol", "code", "종목코드"],
+        "name": ["Name", "name", "종목명"],
+        "sector": ["Sector", "Industry", "sector", "업종"],
+        "close_capapi": ["Close", "close", "종가"],
+        "volume": ["Volume", "volume", "거래량"],
+        "trading_value": ["Amount", "TradingValue", "Value", "amount", "거래대금"],
+        "market_cap_capapi": ["Marcap", "MarketCap", "market_cap", "시가총액"],
+        "listed_shares": ["Stocks", "Shares", "listed_shares", "상장주식수"],
     }
+
     out = pd.DataFrame(index=x.index)
     for target, choices in aliases.items():
         found = next((c for c in choices if c in x.columns), None)
         out[target] = x[found] if found is not None else np.nan
 
-    out["ticker"] = out["ticker"].astype(str).str.extract(r"(\d{6})", expand=False).fillna(out["ticker"].astype(str)).str.zfill(6)
-    out["market"] = out["market"].astype(str).str.upper()
-    out = out[out["market"].isin(markets)].copy()
+    out["ticker"] = (
+        out["ticker"].astype(str)
+        .str.extract(r"(\d{6})", expand=False)
+        .fillna(out["ticker"].astype(str))
+        .str.zfill(6)
+    )
+    out["market"] = forced_market
+    out["name"] = out["name"].fillna("").astype(str)
+    out["sector"] = out["sector"].fillna("SECTOR_UNKNOWN").astype(str)
 
     for c in ["close_capapi", "volume", "trading_value", "market_cap_capapi", "listed_shares"]:
         out[c] = pd.to_numeric(out[c], errors="coerce")
-    out["name"] = out["name"].fillna("").astype(str)
-    out["sector"] = out["sector"].fillna("SECTOR_UNKNOWN").astype(str)
+
+    # Require a usable ticker and positive current market cap for the selection frame.
+    out = out[out["ticker"].str.fullmatch(r"\d{6}", na=False)].copy()
     return out.reset_index(drop=True)
+
+
+def _fdr_current_snapshot(markets: tuple[str, ...], diagnostics: dict | None = None) -> pd.DataFrame:
+    """
+    Current-date snapshot via separate FDR market listings.
+    Using separate KOSPI/KOSDAQ requests is more robust than StockListing('KRX')
+    on the deployed FinanceDataReader/Streamlit combination.
+    """
+    fdr = _import_fdr()
+    pieces = []
+
+    for market in markets:
+        try:
+            listing = fdr.StockListing(market)
+            if diagnostics is not None:
+                diagnostics.setdefault("fdr_listing", []).append({
+                    "market": market,
+                    "rows": 0 if listing is None else int(len(listing)),
+                    "columns": [] if listing is None else [str(c) for c in listing.columns],
+                })
+            y = _normalize_fdr_listing_frame(listing, market)
+            if not y.empty:
+                pieces.append(y)
+        except Exception as ex:
+            if diagnostics is not None:
+                diagnostics.setdefault("errors", []).append({
+                    "stage": "snapshot_fdr_market",
+                    "market": market,
+                    "error": f"{type(ex).__name__}: {ex}",
+                })
+
+    if not pieces:
+        return pd.DataFrame()
+
+    return (
+        pd.concat(pieces, ignore_index=True)
+        .drop_duplicates(["market", "ticker"], keep="first")
+        .reset_index(drop=True)
+    )
 
 
 def fetch_snapshot(ref_date, config: UniverseConfig = UniverseConfig(), progress=None):
@@ -243,17 +282,18 @@ def fetch_snapshot(ref_date, config: UniverseConfig = UniverseConfig(), progress
     today_ts = pd.Timestamp(date.today().strftime("%Y%m%d"))
 
     if ref_ts.normalize() == today_ts.normalize():
-        try:
-            fdr_snap = _fdr_current_snapshot(config.markets)
-            if fdr_snap is not None and not fdr_snap.empty:
-                frames.append(fdr_snap)
-                diagnostics["snapshot_source"] = "FDR_CURRENT_KRX_LISTING_SAME_DAY"
-        except Exception as ex:
-            diagnostics["errors"].append(
-                {"stage": "snapshot_fdr_current", "error": f"{type(ex).__name__}: {ex}"}
-            )
-
-    if not frames:
+        fdr_snap = _fdr_current_snapshot(config.markets, diagnostics=diagnostics)
+        if fdr_snap is not None and not fdr_snap.empty:
+            frames.append(fdr_snap)
+            diagnostics["snapshot_source"] = "FDR_KOSPI_KOSDAQ_LISTINGS_SAME_DAY"
+        else:
+            diagnostics["errors"].append({
+                "stage": "snapshot_fdr_current",
+                "error": "FDR KOSPI/KOSDAQ listings returned no usable rows",
+            })
+    else:
+        # Historical reference dates cannot use current FDR listings.
+        # Keep pykrx as a historical-only fallback; do not contaminate point-in-time data.
         for market in config.markets:
             try:
                 cap = stock.get_market_cap_by_ticker(ref, market)
@@ -266,9 +306,14 @@ def fetch_snapshot(ref_date, config: UniverseConfig = UniverseConfig(), progress
                 frames.append(b)
             except Exception as ex:
                 diagnostics["errors"].append(
-                    {"stage": "snapshot_cap", "market": market, "error": f"{type(ex).__name__}: {ex}"}
+                    {"stage": "snapshot_cap_historical", "market": market,
+                     "error": f"{type(ex).__name__}: {ex}"}
                 )
     if not frames:
+        diagnostics["snapshot_failure"] = (
+            "No usable current KOSPI/KOSDAQ listing snapshot. "
+            "Inspect fdr_listing rows/columns and errors."
+        )
         return pd.DataFrame(), diagnostics
 
     snap = pd.concat(frames, ignore_index=True)
@@ -277,7 +322,7 @@ def fetch_snapshot(ref_date, config: UniverseConfig = UniverseConfig(), progress
     # Name + sector enrichment.
     # If FDR current listing already supplied these fields, keep them.
     # Otherwise try pykrx sector metadata as a non-fatal enrichment.
-    if diagnostics.get("snapshot_source") != "FDR_CURRENT_KRX_LISTING_SAME_DAY":
+    if diagnostics.get("snapshot_source") != "FDR_KOSPI_KOSDAQ_LISTINGS_SAME_DAY":
         sector_pieces = []
         for market in config.markets:
             try:
@@ -303,7 +348,7 @@ def fetch_snapshot(ref_date, config: UniverseConfig = UniverseConfig(), progress
         else:
             diagnostics["sector_source"] = "UNAVAILABLE"
     else:
-        diagnostics["sector_source"] = "FDR_CURRENT_KRX_LISTING_SAME_DAY"
+        diagnostics["sector_source"] = "FDR_KOSPI_KOSDAQ_LISTINGS_SAME_DAY"
 
     if "name" not in snap:
         snap["name"] = ""
