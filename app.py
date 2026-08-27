@@ -7,7 +7,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-st.set_page_config(page_title="Korea OHLCV CSV v0.9 RAW", page_icon="📈")
+st.set_page_config(page_title="Korea OHLCV CSV v0.9.1 RAW DIAG", page_icon="📈")
 
 H = {
     "User-Agent": "Mozilla/5.0",
@@ -96,40 +96,91 @@ def _standardize(df, source):
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_krx_raw(code, start, end):
-    """KRX 비수정(adjusted=False) OHLCV. 긴 기간은 연도 단위로 분할 요청한다."""
+    """
+    KRX 비수정(adjusted=False) OHLCV.
+    - 긴 기간은 연도 단위로 분할
+    - 각 구간별 성공/빈응답/예외를 diagnostics에 기록
+    - adjusted=True 결과는 진단 비교만 수행하며 최종 데이터에는 절대 사용하지 않음
+    """
     try:
+        import pykrx
         from pykrx import stock
     except Exception as ex:
         raise RuntimeError("pykrx를 불러오지 못했습니다. requirements.txt 설치 상태를 확인하세요.") from ex
+
+    diagnostics = {
+        "pykrx_version": getattr(pykrx, "__version__", "unknown"),
+        "code": code,
+        "requested_start": str(start),
+        "requested_end": str(end),
+        "chunks": [],
+    }
 
     pieces = []
     cur = start
     while cur <= end:
         chunk_end = min(date(cur.year, 12, 31), end)
-        df = stock.get_market_ohlcv_by_date(
-            cur.strftime("%Y%m%d"),
-            chunk_end.strftime("%Y%m%d"),
-            code,
-            adjusted=False,
-        )
-        if df is not None and not df.empty:
-            x = df.reset_index()
-            # pykrx 한글 컬럼명 -> 표준명
-            x = x.rename(columns={
-                x.columns[0]: "date",
-                "시가": "open",
-                "고가": "high",
-                "저가": "low",
-                "종가": "close",
-                "거래량": "volume",
-            })
-            pieces.append(x[["date", "open", "high", "low", "close", "volume"]])
+        rec = {
+            "start": str(cur),
+            "end": str(chunk_end),
+            "raw_rows": 0,
+            "adjusted_probe_rows": None,
+            "status": "",
+            "error": "",
+        }
+
+        try:
+            df = stock.get_market_ohlcv_by_date(
+                cur.strftime("%Y%m%d"),
+                chunk_end.strftime("%Y%m%d"),
+                code,
+                adjusted=False,
+            )
+            if df is not None and not df.empty:
+                rec["raw_rows"] = int(len(df))
+                rec["status"] = "RAW_OK"
+                x = df.reset_index()
+                x = x.rename(columns={
+                    x.columns[0]: "date",
+                    "시가": "open",
+                    "고가": "high",
+                    "저가": "low",
+                    "종가": "close",
+                    "거래량": "volume",
+                })
+                pieces.append(x[["date", "open", "high", "low", "close", "volume"]])
+            else:
+                rec["status"] = "RAW_EMPTY"
+
+                # 진단용 probe: adjusted=True로 같은 기간에 데이터가 존재하는지만 본다.
+                # 이 결과는 반환 데이터에 사용하지 않는다.
+                try:
+                    probe = stock.get_market_ohlcv_by_date(
+                        cur.strftime("%Y%m%d"),
+                        chunk_end.strftime("%Y%m%d"),
+                        code,
+                        adjusted=True,
+                    )
+                    rec["adjusted_probe_rows"] = 0 if probe is None else int(len(probe))
+                    if rec["adjusted_probe_rows"] > 0:
+                        rec["status"] = "RAW_EMPTY_ADJ_EXISTS"
+                except Exception as pex:
+                    rec["adjusted_probe_rows"] = -1
+                    rec["error"] = f"probe:{type(pex).__name__}: {pex}"
+
+        except Exception as ex:
+            rec["status"] = "RAW_ERROR"
+            rec["error"] = f"{type(ex).__name__}: {ex}"
+
+        diagnostics["chunks"].append(rec)
         cur = chunk_end + timedelta(days=1)
-        time.sleep(0.08)
+        time.sleep(0.12)
 
     if not pieces:
-        return _standardize(pd.DataFrame(), "KRX_RAW")
-    return _standardize(pd.concat(pieces, ignore_index=True), "KRX_RAW")
+        return _standardize(pd.DataFrame(), "KRX_RAW"), diagnostics
+
+    out = _standardize(pd.concat(pieces, ignore_index=True), "KRX_RAW")
+    return out, diagnostics
 
 
 def xmlroot(b):
@@ -185,8 +236,8 @@ def add_audit_columns(df):
     return out
 
 
-st.title("Korea OHLCV CSV v0.9 RAW")
-st.caption("종목명/6자리 코드 · KRX 비수정 OHLCV 우선 · 원본 보존 · 이상치 표시 · 자동보정 없음")
+st.title("Korea OHLCV CSV v0.9.1 RAW DIAG")
+st.caption("종목명/6자리 코드 · KRX 비수정 OHLCV 우선 · 원본 보존 · 이상치 표시 · 자동보정 없음 · 수집 진단 로그")
 
 q = st.text_input(
     "종목명 또는 6자리 종목코드",
@@ -205,6 +256,12 @@ source_mode = st.radio(
     horizontal=True,
 )
 
+st.caption(
+    "진단 상태: RAW_OK=비수정 데이터 성공 / "
+    "RAW_EMPTY_ADJ_EXISTS=비수정은 비었지만 수정주가 계열은 존재 / "
+    "RAW_ERROR=KRX 호출 자체 오류"
+)
+
 if st.button("OHLCV CSV 만들기", type="primary", use_container_width=True):
     if s > e:
         st.error("날짜 범위를 확인하세요.")
@@ -216,16 +273,38 @@ if st.button("OHLCV CSV 만들기", type="primary", use_container_width=True):
         st.stop()
 
     try:
+        diagnostics = None
         if source_mode.startswith("KRX"):
-            df = fetch_krx_raw(x["code"], s, e)
+            df, diagnostics = fetch_krx_raw(x["code"], s, e)
         else:
             df = fetch_naver_fchart(x["code"], s, e)
     except Exception as ex:
         st.error(f"수집 실패: {type(ex).__name__}: {ex}")
         st.stop()
 
+    if diagnostics is not None:
+        st.write(f"종목 해석: **{x['name']} ({x['code']})**")
+        st.write(f"pykrx 버전: **{diagnostics.get('pykrx_version', 'unknown')}**")
+
+        ddf = pd.DataFrame(diagnostics.get("chunks", []))
+        if not ddf.empty:
+            with st.expander("KRX 수집 진단 로그", expanded=True):
+                st.dataframe(ddf, use_container_width=True, hide_index=True)
+                raw_ok = int((ddf["status"] == "RAW_OK").sum())
+                raw_empty_adj = int((ddf["status"] == "RAW_EMPTY_ADJ_EXISTS").sum())
+                raw_err = int((ddf["status"] == "RAW_ERROR").sum())
+                st.write(
+                    f"RAW 성공 구간: **{raw_ok}** / "
+                    f"RAW 비었지만 adjusted probe 존재: **{raw_empty_adj}** / "
+                    f"RAW 오류 구간: **{raw_err}**"
+                )
+
     if df.empty:
-        st.error("데이터가 없습니다.")
+        st.error("KRX RAW 데이터가 없습니다. 위 진단 로그의 status/error를 확인해 주세요.")
+        st.info(
+            "중요: adjusted=True probe는 '데이터 존재 여부' 진단용일 뿐이며, "
+            "CSV에는 사용하지 않습니다. HRF 연구용 원자료는 adjusted=False만 허용합니다."
+        )
         st.stop()
 
     df = add_audit_columns(df)

@@ -1,15 +1,21 @@
-# Korea OHLCV CSV v0.9 RAW
+# Korea OHLCV CSV v0.9.1 RAW DIAG
 
-연구용 한국주식 일봉 OHLCV 수집기.
+v0.9의 연구용 RAW 수집기를 유지하면서 KRX 수집 진단을 강화한 버전입니다.
 
-## v0.9 변경점
-- `SK하이닉스`, `하이닉스`, `하이닉스반도체`, `에스케이하이닉스` → `000660` 직접 해석
-- KRX 비수정(`adjusted=False`) OHLCV를 연구용 기본 소스로 추가
-- 긴 기간은 연도 단위로 분할 수집
-- NAVER FCHART는 보조/대조용으로 유지
-- 요청 시작일보다 실제 수집 시작일이 늦으면 coverage 경고
-- 원본 자동보정 없음
-- `Volume==0` 또는 유효하지 않은 OHLC를 `valid_session=False`로 표시하고 원본 행은 보존
+## 변경점
+- `SK하이닉스`, `하이닉스`, `하이닉스반도체`, `에스케이하이닉스` → `000660` 인식 유지
+- KRX `adjusted=False` 연도 단위 분할 수집 유지
+- 각 연도별 `RAW_OK / RAW_EMPTY_ADJ_EXISTS / RAW_ERROR` 표시
+- pykrx 버전 표시
+- 오류 메시지/빈 응답 여부를 화면에서 바로 확인
+- `adjusted=True`는 오직 "그 기간 데이터가 존재하는지" 진단 probe에만 사용
+- 최종 CSV에는 절대 adjusted=True 데이터를 사용하지 않음
+- 원본 보존 / 자동보정 없음 / valid_session 표시 유지
 
-## HRF 연구 사용 시
-MASTER FREEZE의 연구 규칙을 변경하지 않는다. SK하이닉스 OOS에는 corporate-action boundary 이후의 Raw OHLCV만 사용하고, 데이터 완전성 검증 전 OOS 결과를 열지 않는다.
+## SK하이닉스 테스트
+종목: SK하이닉스
+시작일: 2003-04-14
+종료일: 오늘
+소스: KRX RAW (연구용 권장)
+
+데이터가 없더라도 'KRX 수집 진단 로그' 화면을 캡처하면 원인을 바로 구분할 수 있습니다.
