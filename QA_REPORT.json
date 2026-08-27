@@ -1,21 +1,16 @@
 {
-  "version": "1.0.8",
+  "version": "1.0.9",
   "date": "2026-08-27",
-  "observed_v107": {
-    "snapshot_rows": 2687,
-    "eligible": 2503,
-    "sector_problem": "KOSDAQ listing-board class; KOSPI mostly unknown",
-    "industry_field": "available and economically descriptive"
-  },
-  "fix": {
-    "raw_sector_preserved_as": "listing_board_sector",
-    "selection_sector_source": "FDR Industry",
-    "mapping": "deterministic outcome-blind broad keyword taxonomy",
-    "unmatched": "OTHER_UNKNOWN, retained",
-    "selection_stratum": "market|selection_sector|market_cap_bucket",
-    "liquidity": "still deferred to selected-stock validated OHLCV",
+  "feature": "Development Batch OHLCV",
+  "checks": {
+    "compile_app": true,
+    "compile_universe_engine": true,
+    "uses_universe_selection_order": true,
+    "batch_size_is_operational_not_research_gate": true,
+    "krx_direct_raw_adjStkPrc_1": true,
+    "optional_ACC_TRDVAL_preserved": true,
+    "median_trading_value_20_valid_sessions": true,
     "future_outcomes_opened": false
   },
-  "compile": "PASS",
   "live_retest_required": true
 }

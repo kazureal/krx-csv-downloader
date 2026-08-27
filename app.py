@@ -4,6 +4,7 @@ import io
 import json
 import zipfile
 import hashlib
+import math
 import xml.etree.ElementTree as ET
 from datetime import date, timedelta
 
@@ -11,9 +12,9 @@ import pandas as pd
 import requests
 import streamlit as st
 
-from universe_engine_v0_1_8 import UniverseConfig, build_universe
+from universe_engine_v0_1_9 import UniverseConfig, build_universe
 
-st.set_page_config(page_title="Korea OHLCV CSV v1.0.8 STOCK + INDEX + UNIVERSE", page_icon="📈")
+st.set_page_config(page_title="Korea OHLCV CSV v1.0.9 STOCK + INDEX + UNIVERSE + BATCH", page_icon="📈")
 
 H = {
     "User-Agent": "Mozilla/5.0",
@@ -317,6 +318,236 @@ def fetch_krx_direct_raw(code, start, end, login_id="", login_pw=""):
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
+
+def fetch_krx_direct_raw_batch(code, start, end, login_id="", login_pw=""):
+    """
+    Batch Development fetcher.
+
+    Same KRX DIRECT RAW endpoint and non-adjusted price path as the existing
+    single-stock downloader, but preserves optional ACC_TRDVAL when present.
+    This is structural data only; no H15/MFE/MAE outcome is calculated.
+    """
+    session = requests.Session()
+    h = _krx_headers()
+
+    try:
+        session.get(KRX_REFERER, headers={"User-Agent": h["User-Agent"]}, timeout=15)
+    except Exception:
+        pass
+
+    login_diag = _krx_login(session, login_id, login_pw)
+    isin, isin_status, isin_error = _krx_find_isin(session, code)
+
+    diag = {
+        "code": code,
+        "requested_start": str(start),
+        "requested_end": str(end),
+        "login_attempted": login_diag["attempted"],
+        "login_success": login_diag["success"],
+        "isin": isin,
+        "isin_status": isin_status,
+        "isin_error": isin_error,
+        "chunks": [],
+        "future_outcomes_opened": False,
+    }
+    if not isin:
+        return pd.DataFrame(), diag
+
+    pieces = []
+    cur = start
+    while cur <= end:
+        chunk_end = min(cur + timedelta(days=699), end)
+        rec = {
+            "start": str(cur),
+            "end": str(chunk_end),
+            "rows": 0,
+            "status": "",
+            "error": "",
+        }
+        payload = {
+            "bld": "dbms/MDC/STAT/standard/MDCSTAT01701",
+            "isuCd": isin,
+            "strtDd": cur.strftime("%Y%m%d"),
+            "endDd": chunk_end.strftime("%Y%m%d"),
+            "adjStkPrc": "1",
+        }
+        try:
+            r = session.post(KRX_JSON_URL, data=payload, headers=h, timeout=30)
+            data = r.json()
+            rows = data.get("output") or []
+            rec["rows"] = int(len(rows))
+            if not rows:
+                rec["status"] = "RAW_EMPTY"
+            else:
+                x = pd.DataFrame(rows)
+                required = {
+                    "TRD_DD": "date",
+                    "TDD_OPNPRC": "open",
+                    "TDD_HGPRC": "high",
+                    "TDD_LWPRC": "low",
+                    "TDD_CLSPRC": "close",
+                    "ACC_TRDVOL": "volume",
+                }
+                missing = [c for c in required if c not in x.columns]
+                if missing:
+                    rec["status"] = "SCHEMA_ERROR"
+                    rec["error"] = f"missing={missing}; columns={x.columns.tolist()[:30]}"
+                else:
+                    keep = list(required)
+                    if "ACC_TRDVAL" in x.columns:
+                        keep.append("ACC_TRDVAL")
+                    y = x[keep].rename(columns=required | {"ACC_TRDVAL": "trading_value"})
+                    y["date"] = pd.to_datetime(y["date"], format="%Y/%m/%d", errors="coerce")
+                    for c in ["open", "high", "low", "close", "volume", "trading_value"]:
+                        if c in y.columns:
+                            y[c] = y[c].map(_clean_krx_num)
+                    pieces.append(y)
+                    rec["status"] = "RAW_OK"
+        except Exception as ex:
+            rec["status"] = "REQUEST_ERROR"
+            rec["error"] = f"{type(ex).__name__}: {ex}"
+
+        diag["chunks"].append(rec)
+        cur = chunk_end + timedelta(days=1)
+        time.sleep(0.20)
+
+    if not pieces:
+        return pd.DataFrame(), diag
+
+    out = pd.concat(pieces, ignore_index=True)
+    need = ["date", "open", "high", "low", "close", "volume"]
+    out = out.dropna(subset=need).sort_values("date").drop_duplicates("date", keep="last").reset_index(drop=True)
+
+    for c in ["open", "high", "low", "close", "volume"]:
+        out[c] = pd.to_numeric(out[c], errors="coerce").astype("Int64")
+    if "trading_value" in out.columns:
+        out["trading_value"] = pd.to_numeric(out["trading_value"], errors="coerce").astype("Int64")
+    else:
+        out["trading_value"] = pd.Series(pd.NA, index=out.index, dtype="Int64")
+
+    finite = out[["open", "high", "low", "close"]].notna().all(axis=1)
+    out["valid_session"] = (out["volume"].fillna(0) != 0) & finite
+    out["source"] = "KRX_DIRECT_RAW_BATCH"
+    out["auto_corrected"] = False
+    return out, diag
+
+
+def parse_universe_bundle(uploaded):
+    raw = uploaded.getvalue()
+    with zipfile.ZipFile(io.BytesIO(raw), "r") as zf:
+        names = set(zf.namelist())
+        required = {"development_selection_order.csv", "universe_audit.json"}
+        missing = required - names
+        if missing:
+            raise ValueError(f"Universe ZIP 필수파일 누락: {sorted(missing)}")
+        order = pd.read_csv(zf.open("development_selection_order.csv"), dtype={"ticker": str})
+        audit = json.load(zf.open("universe_audit.json"))
+
+    order["ticker"] = order["ticker"].astype(str).str.zfill(6)
+    if "development_selection_order" not in order.columns:
+        raise ValueError("development_selection_order 열이 없습니다.")
+    order = order.sort_values("development_selection_order").reset_index(drop=True)
+    return order, audit
+
+
+def make_batch_bundle(order_slice, start_date, end_date, login_id="", login_pw="", progress=None):
+    results = []
+    audit_rows = []
+    files = {}
+
+    total = max(1, len(order_slice))
+    for i, row in order_slice.iterrows():
+        pos = int(row["development_selection_order"])
+        ticker = str(row["ticker"]).zfill(6)
+        name = str(row.get("name", ticker))
+        if progress:
+            progress((len(results)) / total, f"{pos}: {name} ({ticker}) 수집 중")
+
+        df, diag = fetch_krx_direct_raw_batch(
+            ticker, start_date, end_date, login_id=login_id, login_pw=login_pw
+        )
+
+        rec = {
+            "development_selection_order": pos,
+            "ticker": ticker,
+            "name": name,
+            "market": row.get("market", ""),
+            "selection_sector": row.get("selection_sector", ""),
+            "selection_stratum": row.get("selection_stratum", ""),
+            "status": "OK" if not df.empty else "NO_DATA",
+            "rows": int(len(df)),
+            "valid_sessions": int(df["valid_session"].sum()) if not df.empty else 0,
+            "actual_start": str(df["date"].min().date()) if not df.empty else "",
+            "actual_end": str(df["date"].max().date()) if not df.empty else "",
+            "trading_value_nonnull": int(df["trading_value"].notna().sum()) if not df.empty else 0,
+            "median_trading_value_20d": None,
+            "liquidity_status": "",
+            "future_outcomes_opened": False,
+        }
+
+        if not df.empty:
+            valid = df[df["valid_session"]].copy()
+            tv = valid["trading_value"].dropna()
+            if len(tv) >= 20:
+                rec["median_trading_value_20d"] = float(tv.tail(20).median())
+                rec["liquidity_status"] = "READY_20_VALID_SESSIONS"
+            else:
+                rec["liquidity_status"] = "UNKNOWN_TRADING_VALUE_SUPPORT"
+
+            export = df.copy()
+            export["date"] = pd.to_datetime(export["date"]).dt.strftime("%Y-%m-%d")
+            safe_name = safe_filename_piece(name)
+            fn = f"{pos:04d}_{safe_name}_{ticker}_{rec['actual_start'].replace('-','')}_{rec['actual_end'].replace('-','')}.csv"
+            payload = export.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+            files[f"ohlcv/{fn}"] = payload
+            rec["sha256"] = hashlib.sha256(payload).hexdigest()
+            rec["file"] = f"ohlcv/{fn}"
+        else:
+            rec["liquidity_status"] = "UNKNOWN_NO_OHLCV"
+            rec["sha256"] = ""
+            rec["file"] = ""
+
+        audit_rows.append({
+            "development_selection_order": pos,
+            "ticker": ticker,
+            "name": name,
+            "diag": diag,
+        })
+        results.append(rec)
+
+    manifest_df = pd.DataFrame(results)
+    manifest_bytes = manifest_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+    files["batch_manifest.csv"] = manifest_bytes
+
+    audit_obj = {
+        "app_build": "APP_v1.0.9",
+        "engine_build": "UNIVERSE_ENGINE_v0.1.9",
+        "batch_start_order": int(order_slice["development_selection_order"].min()),
+        "batch_end_order": int(order_slice["development_selection_order"].max()),
+        "requested_start": str(start_date),
+        "requested_end": str(end_date),
+        "stock_count": int(len(order_slice)),
+        "future_outcomes_opened": False,
+        "stocks": audit_rows,
+    }
+    audit_bytes = json.dumps(audit_obj, ensure_ascii=False, indent=2, default=str).encode("utf-8")
+    files["batch_audit.json"] = audit_bytes
+
+    sha_manifest = {k: hashlib.sha256(v).hexdigest() for k, v in files.items()}
+    sha_bytes = json.dumps(sha_manifest, ensure_ascii=False, indent=2).encode("utf-8")
+    files["SHA256_MANIFEST.json"] = sha_bytes
+
+    bio = io.BytesIO()
+    with zipfile.ZipFile(bio, "w", zipfile.ZIP_DEFLATED) as zf:
+        for name, payload in files.items():
+            zf.writestr(name, payload)
+
+    if progress:
+        progress(1.0, "배치 완료")
+    return bio.getvalue(), manifest_df
+
+
+
 def fetch_krx_raw(code, start, end):
     """
     KRX 비수정(adjusted=False) OHLCV.
@@ -751,17 +982,17 @@ def make_csv_filename(name, df, partial=False):
     return f"{safe_filename_piece(name)}_{start}_{end}_생성{created}{suffix}.csv"
 
 
-st.title("Korea OHLCV CSV v1.0.8 STOCK + INDEX + UNIVERSE")
+st.title("Korea OHLCV CSV v1.0.9 STOCK + INDEX + UNIVERSE + BATCH")
 st.caption(
     "개별주식 KRX DIRECT RAW + KOSPI/KOSDAQ 지수(FDR) + "
     "Track 02 Development Universe · 원본 보존 · outcome-blind"
 )
 
-st.caption("BUILD: APP_v1.0.8 / UNIVERSE_ENGINE_v0.1.8")
+st.caption("BUILD: APP_v1.0.9 / UNIVERSE_ENGINE_v0.1.9 / BATCH_OHLCV_v0.1")
 
 data_kind = st.radio(
     "수집 대상",
-    ["개별주식", "시장지수", "Development Universe"],
+    ["개별주식", "시장지수", "Development Universe", "Development Batch OHLCV"],
     horizontal=True,
 )
 
@@ -888,6 +1119,143 @@ if data_kind == "Development Universe":
             "Safari 다운로드 위치를 '나의 iPhone/GPT/주식시세추이'로 지정했다면 "
             "위 ZIP은 그 폴더로 저장됩니다."
         )
+
+# ---------------------------------------------------------------------
+# DEVELOPMENT BATCH OHLCV
+# ---------------------------------------------------------------------
+elif data_kind == "Development Batch OHLCV":
+    st.info(
+        "승인된 Universe Audit Bundle ZIP을 입력으로 사용해 deterministic selection order를 그대로 따라갑니다. "
+        "배치 크기는 서버 운영 단위일 뿐 연구 표본수 기준이 아닙니다."
+    )
+
+    uploaded = st.file_uploader(
+        "승인된 Universe Audit Bundle ZIP",
+        type=["zip"],
+        accept_multiple_files=False,
+    )
+
+    c1, c2 = st.columns(2)
+    with c1:
+        batch_size = st.number_input(
+            "운영 배치 크기",
+            min_value=1,
+            max_value=20,
+            value=10,
+            step=1,
+            help="서버 timeout 방지용 운영 단위. 연구 기준이 아닙니다.",
+        )
+    with c2:
+        batch_no = st.number_input(
+            "배치 번호",
+            min_value=1,
+            value=1,
+            step=1,
+        )
+
+    d1, d2 = st.columns(2)
+    with d1:
+        batch_start = st.date_input(
+            "OHLCV 시작일",
+            value=date(2010, 1, 4),
+            min_value=date(1990, 1, 1),
+            max_value=date.today(),
+            key="batch_start",
+        )
+    with d2:
+        batch_end = st.date_input(
+            "OHLCV 종료일",
+            value=date.today(),
+            min_value=date(1990, 1, 1),
+            max_value=date.today(),
+            key="batch_end",
+        )
+
+    with st.expander("KRX 로그인 (선택 사항 — 익명 수집 실패 시만 사용)", expanded=False):
+        st.caption("ID/비밀번호는 메모리에서만 사용하며 ZIP/로그에 저장하지 않습니다.")
+        batch_krx_id = st.text_input("KRX ID", value="", key="batch_krx_id")
+        batch_krx_pw = st.text_input("KRX 비밀번호", value="", type="password", key="batch_krx_pw")
+
+    if uploaded is not None:
+        try:
+            order, uaudit = parse_universe_bundle(uploaded)
+        except Exception as ex:
+            st.error(f"Universe ZIP 해석 실패: {type(ex).__name__}: {ex}")
+            st.stop()
+
+        st.write(
+            f"Universe engine: **{uaudit.get('engine_build', 'UNKNOWN')}** · "
+            f"candidate rows: **{len(order):,}** · "
+            f"outcomes opened: **{uaudit.get('outcomes_opened', 'UNKNOWN')}**"
+        )
+
+        start_idx = (int(batch_no) - 1) * int(batch_size)
+        end_idx = min(start_idx + int(batch_size), len(order))
+        if start_idx >= len(order):
+            st.warning("해당 배치 번호는 selection order 범위를 벗어납니다.")
+        else:
+            sl = order.iloc[start_idx:end_idx].copy()
+            st.subheader(
+                f"Batch {int(batch_no)} · selection order "
+                f"{int(sl.development_selection_order.min())}~{int(sl.development_selection_order.max())}"
+            )
+            show = [c for c in [
+                "development_selection_order", "ticker", "name", "market",
+                "selection_sector", "market_cap_bucket", "selection_stratum"
+            ] if c in sl.columns]
+            st.dataframe(sl[show], use_container_width=True, hide_index=True)
+
+            if st.button("Development Batch OHLCV 만들기", type="primary", use_container_width=True):
+                if batch_start > batch_end:
+                    st.error("OHLCV 시작일/종료일을 확인하세요.")
+                    st.stop()
+
+                prog = st.progress(0, text="배치 준비 중")
+                def pcb(p, msg):
+                    prog.progress(min(max(float(p), 0.0), 1.0), text=msg)
+
+                try:
+                    payload, manifest_df = make_batch_bundle(
+                        sl,
+                        batch_start,
+                        batch_end,
+                        login_id=batch_krx_id,
+                        login_pw=batch_krx_pw,
+                        progress=pcb,
+                    )
+                except Exception as ex:
+                    prog.empty()
+                    st.error(f"Batch 생성 실패: {type(ex).__name__}: {ex}")
+                    st.stop()
+                prog.empty()
+
+                ok = int((manifest_df["status"] == "OK").sum())
+                liq_ready = int((manifest_df["liquidity_status"] == "READY_20_VALID_SESSIONS").sum())
+                st.success(
+                    f"배치 완료 · OHLCV 성공 {ok}/{len(manifest_df)} · "
+                    f"20일 중위 거래대금 준비 {liq_ready}/{len(manifest_df)}"
+                )
+                st.dataframe(manifest_df, use_container_width=True, hide_index=True)
+
+                created = date.today().strftime("%Y%m%d")
+                bname = (
+                    f"DEV_BATCH_{int(batch_no):03d}_"
+                    f"ORD{int(sl.development_selection_order.min()):04d}-"
+                    f"{int(sl.development_selection_order.max()):04d}_"
+                    f"{batch_start.strftime('%Y%m%d')}_{batch_end.strftime('%Y%m%d')}_"
+                    f"생성{created}.zip"
+                )
+                st.download_button(
+                    "Development Batch ZIP 다운로드",
+                    payload,
+                    file_name=bname,
+                    mime="application/zip",
+                    use_container_width=True,
+                )
+                st.caption(
+                    "ZIP 안에는 종목별 OHLCV CSV, batch_manifest.csv, batch_audit.json, "
+                    "SHA256_MANIFEST.json이 들어 있습니다. H15/MFE/MAE는 생성하지 않습니다."
+                )
 
 # ---------------------------------------------------------------------
 # STOCK / INDEX — existing v0.9.9 data paths preserved

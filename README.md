@@ -1,4 +1,4 @@
-# Korea OHLCV CSV v1.0.8 — STOCK + INDEX + UNIVERSE
+# Korea OHLCV CSV v1.0.9 — STOCK + INDEX + UNIVERSE
 
 ## 이번 업데이트
 기존 v0.9.9의 동작을 유지하면서 아래를 추가했습니다.
@@ -187,3 +187,37 @@ v1.0.7 audit 결과:
 - selection_stratum = market | selection_sector | market-cap tercile
 - liquidity는 계속 selected-stock OHLCV 단계에서 계산
 - H15/MFE/MAE future outcome 봉인 유지
+
+
+## v1.0.9 Development Batch OHLCV
+새 모드: `Development Batch OHLCV`
+
+입력:
+- 승인된 Universe Audit Bundle ZIP
+- 운영 배치 크기(기본 10, max 20)
+- 배치 번호
+- OHLCV 기간
+
+원칙:
+- `development_selection_order`를 그대로 사용
+- 배치 크기는 서버 timeout 회피용 운영 단위이며 연구 표본수 기준이 아님
+- 종목을 수동으로 골라 넣지 않음
+- 기존 KRX DIRECT RAW endpoint / adjStkPrc=1 사용
+- optional `ACC_TRDVAL`이 존재하면 trading_value 보존
+- 각 종목 valid-session 기준 마지막 20개 trading_value의 median 계산
+- trading_value가 충분하지 않으면 UNKNOWN_TRADING_VALUE_SUPPORT
+- H15/MFE/MAE/tail outcome 계산 금지
+
+출력 ZIP:
+- `ohlcv/*.csv`
+- `batch_manifest.csv`
+- `batch_audit.json`
+- `SHA256_MANIFEST.json`
+
+권장 첫 실행:
+- Universe ZIP: 승인된 v1.0.8 결과
+- 배치 크기: 10
+- 배치 번호: 1
+- 기간: 2010-01-04 ~ 2026-08-27
+
+첫 배치가 정상인지 확인한 뒤 다음 배치로 진행합니다.
