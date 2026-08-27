@@ -1,19 +1,22 @@
 {
-  "version": "1.0.1",
+  "version": "1.0.2",
   "date": "2026-08-27",
-  "trigger": "Real Streamlit/iPhone Universe test",
-  "observed_error": "IndexError: index -1 is out of bounds for axis 0 with size 0",
+  "observed_user_test": {
+    "reference_business_day_resolved": "20260827",
+    "liquidity_days": 20,
+    "pykrx_version": "1.2.8",
+    "snapshot_errors": [
+      "KOSPI KeyError: 종가",
+      "KOSDAQ KeyError: 종가"
+    ]
+  },
   "fix": {
-    "reference_business_day": "FDR KS11 actual trading calendar first",
-    "prior_20_sessions": "FDR KS11 actual trading calendar",
-    "fallback": "pykrx KOSPI market-cap backward probe",
-    "guessed_weekdays": false
+    "market_cap_snapshot": "pykrx get_market_cap_by_ticker",
+    "sector_primary": "pykrx sector API, non-fatal",
+    "sector_fallback": "FDR KRX listing only when ref_date == today",
+    "historical_sector_lookahead": "prohibited; use SECTOR_UNKNOWN"
   },
-  "checks": {
-    "compile_app": true,
-    "compile_universe_engine": true,
-    "stock_index_paths_preserved": true,
-    "future_response_outcomes_opened": false
-  },
-  "live_note": "Stock and KOSPI CSV downloads were user-verified. Universe v1.0.1 requires re-test in Streamlit."
+  "compile": "PASS",
+  "future_response_outcomes_opened": false,
+  "live_retest_required": true
 }

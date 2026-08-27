@@ -1,4 +1,4 @@
-# HRF Track 02 — Point-in-Time Development Universe Engine v0.1.1
+# HRF Track 02 — Point-in-Time Development Universe Engine v0.1.2
 # Outcome-blind. Does not read H15 / MFE / MAE / tail outcomes.
 
 from __future__ import annotations
@@ -174,19 +174,21 @@ def fetch_snapshot(ref_date, config: UniverseConfig = UniverseConfig(), progress
         "outcomes_opened": False,
     }
 
-    # Point-in-time sector + market-cap snapshot.
+    # Point-in-time market-cap snapshot.
+    # v0.1.2: do NOT make sector classification a hard dependency.
+    # pykrx 1.2.8 can raise KeyError('종가') inside get_market_sector_classifications().
+    # We first build the universe from market-cap/ticker data, then enrich sector separately.
     for market in config.markets:
         try:
-            sec = stock.get_market_sector_classifications(ref, market)
             cap = stock.get_market_cap_by_ticker(ref, market)
-            a = _normalize_sector_frame(sec, market)
             b = _normalize_cap_frame(cap)
-            x = a.merge(b, on="ticker", how="outer", validate="one_to_one")
-            x["market"] = x["market"].fillna(market)
-            frames.append(x)
+            if b.empty:
+                raise RuntimeError("empty market-cap snapshot")
+            b["market"] = market
+            frames.append(b)
         except Exception as ex:
             diagnostics["errors"].append(
-                {"stage": "snapshot", "market": market, "error": f"{type(ex).__name__}: {ex}"}
+                {"stage": "snapshot_cap", "market": market, "error": f"{type(ex).__name__}: {ex}"}
             )
 
     if not frames:
@@ -194,6 +196,72 @@ def fetch_snapshot(ref_date, config: UniverseConfig = UniverseConfig(), progress
 
     snap = pd.concat(frames, ignore_index=True)
     snap = snap.drop_duplicates(["market", "ticker"], keep="first")
+
+    # Name + sector enrichment.
+    # Primary attempt: pykrx sector API.
+    # If pykrx sector API fails (observed on pykrx 1.2.8 with KeyError '종가'),
+    # use FinanceDataReader current KRX listing ONLY when ref date is the current date.
+    sector_pieces = []
+    for market in config.markets:
+        try:
+            sec = stock.get_market_sector_classifications(ref, market)
+            a = _normalize_sector_frame(sec, market)
+            if not a.empty:
+                sector_pieces.append(a[["ticker", "name", "sector", "market"]])
+        except Exception as ex:
+            diagnostics["errors"].append(
+                {"stage": "sector_primary", "market": market, "error": f"{type(ex).__name__}: {ex}"}
+            )
+
+    if sector_pieces:
+        sec_all = pd.concat(sector_pieces, ignore_index=True).drop_duplicates(["market", "ticker"])
+        snap = snap.merge(sec_all, on=["market", "ticker"], how="left")
+        diagnostics["sector_source"] = "PYKRX_POINT_IN_TIME"
+    else:
+        snap["name"] = ""
+        snap["sector"] = np.nan
+        diagnostics["sector_source"] = "UNAVAILABLE"
+
+        ref_ts = pd.Timestamp(ref)
+        today_ts = pd.Timestamp(date.today().strftime("%Y%m%d"))
+        if ref_ts.normalize() == today_ts.normalize():
+            try:
+                fdr = _import_fdr()
+                listing = fdr.StockListing("KRX")
+                if listing is not None and not listing.empty:
+                    lx = listing.copy()
+                    # Common FDR schemas: Code, Name, Market, Sector / Industry
+                    code_col = "Code" if "Code" in lx.columns else ("Symbol" if "Symbol" in lx.columns else None)
+                    name_col = "Name" if "Name" in lx.columns else None
+                    market_col = "Market" if "Market" in lx.columns else None
+                    sector_col = "Sector" if "Sector" in lx.columns else ("Industry" if "Industry" in lx.columns else None)
+                    if code_col:
+                        lx["ticker"] = lx[code_col].astype(str).str.zfill(6)
+                        if market_col:
+                            lx["market"] = lx[market_col].astype(str).str.upper()
+                        else:
+                            lx["market"] = ""
+                        lx["name_fdr"] = lx[name_col].astype(str) if name_col else ""
+                        lx["sector_fdr"] = lx[sector_col].astype(str) if sector_col else "SECTOR_UNKNOWN"
+                        lx = lx[["ticker", "market", "name_fdr", "sector_fdr"]].drop_duplicates(["ticker", "market"])
+                        snap = snap.merge(lx, on=["ticker", "market"], how="left")
+                        snap["name"] = snap["name_fdr"].fillna("")
+                        snap["sector"] = snap["sector_fdr"].replace({"nan": np.nan})
+                        snap = snap.drop(columns=["name_fdr", "sector_fdr"])
+                        diagnostics["sector_source"] = "FDR_CURRENT_LISTING_SAME_DAY_FALLBACK"
+            except Exception as ex:
+                diagnostics["errors"].append(
+                    {"stage": "sector_fallback_fdr", "error": f"{type(ex).__name__}: {ex}"}
+                )
+
+    # Final name fallback: ticker string if name unavailable.
+    if "name" not in snap:
+        snap["name"] = ""
+    snap["name"] = snap["name"].fillna("")
+    snap.loc[snap["name"].eq(""), "name"] = snap.loc[snap["name"].eq(""), "ticker"]
+    if "sector" not in snap:
+        snap["sector"] = "SECTOR_UNKNOWN"
+    snap["sector"] = snap["sector"].fillna("SECTOR_UNKNOWN")
 
     # Prior 20 valid market sessions' daily trading value. One request per date/market.
     tv_records = []
@@ -260,9 +328,10 @@ def classify_common_stock_candidates(snapshot: pd.DataFrame) -> pd.DataFrame:
         "COMMON_STOCK_CANDIDATE_UNVERIFIED_SECURITY_CLASS"
     )
 
-    required_numeric = (
-        pd.to_numeric(x.get("market_cap"), errors="coerce").fillna(0) > 0
-    )
+    cap_series = x["market_cap"] if "market_cap" in x.columns else x.get("market_cap_capapi")
+    required_numeric = pd.to_numeric(cap_series, errors="coerce").fillna(0) > 0
+    if "market_cap" not in x.columns and "market_cap_capapi" in x.columns:
+        x["market_cap"] = pd.to_numeric(x["market_cap_capapi"], errors="coerce")
     x["eligible_common_candidate"] = (
         x["market"].isin(["KOSPI", "KOSDAQ"])
         & ~x["is_preferred_name_pattern"]

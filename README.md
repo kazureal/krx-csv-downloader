@@ -1,4 +1,4 @@
-# Korea OHLCV CSV v1.0.1 — STOCK + INDEX + UNIVERSE
+# Korea OHLCV CSV v1.0.2 — STOCK + INDEX + UNIVERSE
 
 ## 이번 업데이트
 기존 v0.9.9의 동작을 유지하면서 아래를 추가했습니다.
@@ -67,3 +67,17 @@ GitHub의 기존 `app.py`를 이 패키지의 `app.py`로 교체하고,
 - Universe snapshot/sector/market-cap/trading-value 본체는 기존 pykrx 구조 유지
 
 이 수정은 future H15/MFE/MAE outcome을 사용하지 않습니다.
+
+
+## v1.0.2 Universe hotfix
+실제 Streamlit 테스트에서 기준 영업일/20거래일 계산은 정상화되었지만,
+pykrx 1.2.8의 `get_market_sector_classifications()` 내부에서
+`KeyError: '종가'`가 KOSPI/KOSDAQ 모두 발생했습니다.
+
+수정:
+- Universe 본체는 `get_market_cap_by_ticker()`로 먼저 구성
+- 업종 API 실패가 전체 Universe 생성을 중단시키지 않게 변경
+- 같은 날(current reference date)인 경우에만 FDR KRX listing으로 종목명/업종 fallback
+- historical reference date에서는 current-sector fallback을 쓰지 않고 `SECTOR_UNKNOWN`
+- 따라서 과거 기준일에 현재 업종을 섞는 look-ahead를 금지
+- H15/MFE/MAE 등 미래 outcome은 계속 사용하지 않음
