@@ -1,4 +1,4 @@
-# Korea OHLCV CSV v1.0.7 — STOCK + INDEX + UNIVERSE
+# Korea OHLCV CSV v1.0.8 — STOCK + INDEX + UNIVERSE
 
 ## 이번 업데이트
 기존 v0.9.9의 동작을 유지하면서 아래를 추가했습니다.
@@ -169,4 +169,21 @@ v1.0.6은 snapshot 자체는 성공했지만 audit에서 40개 오류가 확인�
 - 20일 중위 거래대금은 선정된 각 종목의 검증 OHLCV에서 계산하도록 명시적으로 deferred
 - current-day 거래대금으로 20일 median을 대체하지 않음
 - selection order는 market + sector + market-cap bucket만 사용
+- H15/MFE/MAE future outcome 봉인 유지
+
+
+## v1.0.8 sector-definition fix
+v1.0.7 audit 결과:
+- KOSDAQ `Sector` = 우량기업부/중견기업부/벤처기업부 등 소속부 분류
+- KOSPI `Sector` = 대부분 미제공
+- `Industry`는 의약품 제조업, 반도체 제조업, 소프트웨어 개발 및 공급업 등 실제 경제 활동 분류
+
+따라서:
+- raw `Sector`는 `listing_board_sector`로 보존
+- `Industry`는 원문 그대로 보존
+- Development stratification에는 `selection_sector`를 새로 사용
+- `selection_sector`는 Industry 텍스트를 outcome-blind deterministic keyword taxonomy로 broad mapping
+- unmatched는 `OTHER_UNKNOWN`; 절대 삭제하지 않음
+- selection_stratum = market | selection_sector | market-cap tercile
+- liquidity는 계속 selected-stock OHLCV 단계에서 계산
 - H15/MFE/MAE future outcome 봉인 유지

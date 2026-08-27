@@ -1,19 +1,19 @@
 {
-  "version": "1.0.7",
+  "version": "1.0.8",
   "date": "2026-08-27",
-  "input_audit_v106": {
+  "observed_v107": {
     "snapshot_rows": 2687,
-    "eligible_v106": 2553,
-    "errors": 40,
-    "error_family": "pykrx get_market_ohlcv_by_ticker schema failure",
-    "median_trading_value_20d": "all missing",
-    "sector": "all SECTOR_UNKNOWN"
+    "eligible": 2503,
+    "sector_problem": "KOSDAQ listing-board class; KOSPI mostly unknown",
+    "industry_field": "available and economically descriptive"
   },
   "fix": {
-    "sector_and_listing_date": "FDR KOSPI-DESC/KOSDAQ-DESC same-day merge",
-    "common_stock_crosscheck": "DESC membership + existing name-pattern exclusions",
-    "liquidity": "deferred to selected-stock validated OHLCV prior-20 median",
-    "selection_uses_liquidity": false,
+    "raw_sector_preserved_as": "listing_board_sector",
+    "selection_sector_source": "FDR Industry",
+    "mapping": "deterministic outcome-blind broad keyword taxonomy",
+    "unmatched": "OTHER_UNKNOWN, retained",
+    "selection_stratum": "market|selection_sector|market_cap_bucket",
+    "liquidity": "still deferred to selected-stock validated OHLCV",
     "future_outcomes_opened": false
   },
   "compile": "PASS",

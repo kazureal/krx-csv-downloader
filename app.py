@@ -11,9 +11,9 @@ import pandas as pd
 import requests
 import streamlit as st
 
-from universe_engine_v0_1_7 import UniverseConfig, build_universe
+from universe_engine_v0_1_8 import UniverseConfig, build_universe
 
-st.set_page_config(page_title="Korea OHLCV CSV v1.0.7 STOCK + INDEX + UNIVERSE", page_icon="📈")
+st.set_page_config(page_title="Korea OHLCV CSV v1.0.8 STOCK + INDEX + UNIVERSE", page_icon="📈")
 
 H = {
     "User-Agent": "Mozilla/5.0",
@@ -751,13 +751,13 @@ def make_csv_filename(name, df, partial=False):
     return f"{safe_filename_piece(name)}_{start}_{end}_생성{created}{suffix}.csv"
 
 
-st.title("Korea OHLCV CSV v1.0.7 STOCK + INDEX + UNIVERSE")
+st.title("Korea OHLCV CSV v1.0.8 STOCK + INDEX + UNIVERSE")
 st.caption(
     "개별주식 KRX DIRECT RAW + KOSPI/KOSDAQ 지수(FDR) + "
     "Track 02 Development Universe · 원본 보존 · outcome-blind"
 )
 
-st.caption("BUILD: APP_v1.0.7 / UNIVERSE_ENGINE_v0.1.7")
+st.caption("BUILD: APP_v1.0.8 / UNIVERSE_ENGINE_v0.1.8")
 
 data_kind = st.radio(
     "수집 대상",
@@ -781,7 +781,7 @@ if data_kind == "Development Universe":
         key="universe_ref_date",
     )
     st.caption(
-        "고정 설계: KOSPI+KOSDAQ · KRX 업종 · 시장별 시총 tercile · "
+        "고정 설계: KOSPI+KOSDAQ · Industry 기반 broad sector · 시장별 시총 tercile · "
         "직전 20거래일 중위 거래대금 · ticker-stable round-robin"
     )
 
@@ -841,7 +841,7 @@ if data_kind == "Development Universe":
 
         st.subheader("Deterministic Development Selection Order")
         show_cols = [
-            "development_selection_order", "ticker", "name", "market", "sector",
+            "development_selection_order", "ticker", "name", "market", "selection_sector", "industry",
             "market_cap", "median_trading_value_20d", "market_cap_bucket",
             "liquidity_bucket", "selection_stratum", "classification_review_flag",
         ]
