@@ -7,7 +7,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-st.set_page_config(page_title="Korea OHLCV CSV v0.9.2 SOURCE TEST", page_icon="📈")
+st.set_page_config(page_title="Korea OHLCV CSV v0.9.3 FDR SPLIT", page_icon="📈")
 
 H = {
     "User-Agent": "Mozilla/5.0",
@@ -186,9 +186,10 @@ def fetch_krx_raw(code, start, end):
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_fdr_candidate(code, start, end):
     """
-    FinanceDataReader의 국내 종목 경로로 장기 OHLCV coverage를 확인한다.
-    중요: 이 경로는 '장기 이력 후보'이며 HRF 연구용 RAW로 자동 승인하지 않는다.
-    기존 검증 파일과 overlap 대조 후에만 연구 투입 여부를 판단한다.
+    FinanceDataReader 장기이력 후보.
+    - 5년 단위 분할 요청으로 단일 3,000행 제한 가능성을 회피
+    - 조각별 결과를 합친 뒤 날짜 정렬/중복 제거
+    - 이 경로는 HRF 연구용 RAW로 자동 승인하지 않음
     """
     try:
         import FinanceDataReader as fdr
@@ -200,37 +201,71 @@ def fetch_fdr_candidate(code, start, end):
         "code": code,
         "requested_start": str(start),
         "requested_end": str(end),
+        "chunks": [],
     }
-    try:
-        df = fdr.DataReader(code, str(start), str(end))
-        diag["returned_rows"] = 0 if df is None else int(len(df))
-        diag["columns"] = [] if df is None else [str(c) for c in df.columns]
-        if df is None or df.empty:
-            diag["status"] = "FDR_EMPTY"
-            return _standardize(pd.DataFrame(), "FDR_CANDIDATE"), diag
 
-        x = df.reset_index()
-        # FDR common columns: Date/Open/High/Low/Close/Volume/Change
-        ren = {}
-        for c in x.columns:
-            lc = str(c).strip().lower()
-            if lc in ("date", "날짜"): ren[c] = "date"
-            elif lc in ("open", "시가"): ren[c] = "open"
-            elif lc in ("high", "고가"): ren[c] = "high"
-            elif lc in ("low", "저가"): ren[c] = "low"
-            elif lc in ("close", "종가"): ren[c] = "close"
-            elif lc in ("volume", "거래량"): ren[c] = "volume"
-        x = x.rename(columns=ren)
-        out = _standardize(x, "FDR_CANDIDATE")
-        diag["status"] = "FDR_OK" if not out.empty else "FDR_SCHEMA_EMPTY"
-        if not out.empty:
-            diag["actual_start"] = str(out.date.min().date())
-            diag["actual_end"] = str(out.date.max().date())
-        return out, diag
-    except Exception as ex:
-        diag["status"] = "FDR_ERROR"
-        diag["error"] = f"{type(ex).__name__}: {ex}"
+    pieces = []
+    cur = start
+    while cur <= end:
+        # 5년 단위로 잘라 요청
+        chunk_end = min(date(cur.year + 4, 12, 31), end)
+        rec = {
+            "start": str(cur),
+            "end": str(chunk_end),
+            "rows": 0,
+            "actual_start": "",
+            "actual_end": "",
+            "status": "",
+            "error": "",
+        }
+        try:
+            df = fdr.DataReader(code, str(cur), str(chunk_end))
+            if df is None or df.empty:
+                rec["status"] = "FDR_EMPTY"
+            else:
+                rec["rows"] = int(len(df))
+                x = df.reset_index()
+                ren = {}
+                for c in x.columns:
+                    lc = str(c).strip().lower()
+                    if lc in ("date", "날짜"): ren[c] = "date"
+                    elif lc in ("open", "시가"): ren[c] = "open"
+                    elif lc in ("high", "고가"): ren[c] = "high"
+                    elif lc in ("low", "저가"): ren[c] = "low"
+                    elif lc in ("close", "종가"): ren[c] = "close"
+                    elif lc in ("volume", "거래량"): ren[c] = "volume"
+                x = x.rename(columns=ren)
+                out = _standardize(x, "FDR_CANDIDATE")
+                if out.empty:
+                    rec["status"] = "FDR_SCHEMA_EMPTY"
+                else:
+                    rec["status"] = "FDR_OK"
+                    rec["actual_start"] = str(out.date.min().date())
+                    rec["actual_end"] = str(out.date.max().date())
+                    pieces.append(out)
+        except Exception as ex:
+            rec["status"] = "FDR_ERROR"
+            rec["error"] = f"{type(ex).__name__}: {ex}"
+
+        diag["chunks"].append(rec)
+        cur = chunk_end + timedelta(days=1)
+        time.sleep(0.15)
+
+    if not pieces:
+        diag["returned_rows"] = 0
+        diag["status"] = "FDR_EMPTY_ALL"
         return _standardize(pd.DataFrame(), "FDR_CANDIDATE"), diag
+
+    out = pd.concat(pieces, ignore_index=True)
+    out = out.sort_values("date").drop_duplicates(subset=["date"], keep="last").reset_index(drop=True)
+    out = _standardize(out, "FDR_CANDIDATE")
+
+    diag["returned_rows"] = int(len(out))
+    diag["status"] = "FDR_OK"
+    diag["actual_start"] = str(out.date.min().date())
+    diag["actual_end"] = str(out.date.max().date())
+    return out, diag
+
 
 def xmlroot(b):
     t = None
@@ -285,8 +320,8 @@ def add_audit_columns(df):
     return out
 
 
-st.title("Korea OHLCV CSV v0.9.2 SOURCE TEST")
-st.caption("KRX RAW 진단 + FDR/NAVER 장기이력 후보 · 원본 보존 · 자동보정 없음 · 연구 승인 전 소스 대조")
+st.title("Korea OHLCV CSV v0.9.3 FDR SPLIT")
+st.caption("FDR 5년 분할수집 + KRX RAW 진단 · 원본 보존 · 자동보정 없음 · 연구 승인 전 소스 대조")
 
 q = st.text_input(
     "종목명 또는 6자리 종목코드",
@@ -339,14 +374,22 @@ if st.button("OHLCV CSV 만들기", type="primary", use_container_width=True):
         st.write(f"FinanceDataReader 버전: **{fdr_diag.get('fdr_version', 'unknown')}**")
         st.write(
             f"FDR 상태: **{fdr_diag.get('status','')}** / "
-            f"반환 행: **{fdr_diag.get('returned_rows', 0)}**"
+            f"최종 반환 행: **{fdr_diag.get('returned_rows', 0)}**"
         )
         if fdr_diag.get("actual_start"):
             st.write(
                 f"실제 범위: **{fdr_diag.get('actual_start')} ~ {fdr_diag.get('actual_end')}**"
             )
-        if fdr_diag.get("error"):
-            st.error(fdr_diag["error"])
+
+        cdf = pd.DataFrame(fdr_diag.get("chunks", []))
+        if not cdf.empty:
+            with st.expander("FDR 5년 분할수집 로그", expanded=True):
+                st.dataframe(cdf, use_container_width=True, hide_index=True)
+                ok = int((cdf["status"] == "FDR_OK").sum())
+                empty = int((cdf["status"] == "FDR_EMPTY").sum())
+                err = int((cdf["status"] == "FDR_ERROR").sum())
+                st.write(f"성공 구간: **{ok}** / 빈 구간: **{empty}** / 오류 구간: **{err}**")
+
         st.warning(
             "FDR 데이터는 현재 '장기이력 후보'입니다. "
             "기존 검증 원자료와 중첩구간 OHLCV를 대조하기 전에는 HRF OOS에 사용하지 않습니다."
