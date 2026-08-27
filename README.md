@@ -1,4 +1,4 @@
-# Korea OHLCV CSV v1.0.12 — STOCK + INDEX + UNIVERSE
+# Korea OHLCV CSV v1.0.13 — STOCK + INDEX + UNIVERSE
 
 ## 이번 업데이트
 기존 v0.9.9의 동작을 유지하면서 아래를 추가했습니다.
@@ -280,3 +280,22 @@ CSV filename rule:
 - 시간 prefix는 파일 관리/정렬 편의만을 위한 것이며
   연구 selection, 표본수, 구조 규칙에는 영향 없음.
 - H15/MFE/MAE outcome은 계속 봉인.
+
+
+## v1.0.13 request diagnostic
+Batch HTTP 400을 감으로 수정하지 않고 audit으로 원인을 확인하는 진단 버전.
+
+기록:
+- code/start/end 값과 Python type
+- KRX payload와 payload value type
+- request URL
+- HTTP status / Content-Type / response length
+- response 앞 200자
+- JSON parse 결과 / top-level keys
+- warm-up status / ISIN status
+
+ID/PW는 기록하지 않음.
+H15/MFE/MAE future outcome은 계속 봉인.
+selection order는 변경하지 않음.
+
+첫 시험은 Batch 1 / 2종목 / 2010-01-04~2026-08-27 / 로그인 비움.

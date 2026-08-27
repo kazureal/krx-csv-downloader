@@ -1,15 +1,11 @@
 {
-  "version": "1.0.12",
+  "version": "1.0.13",
   "date": "2026-08-27",
-  "checks": {
-    "compile_app": true,
-    "compile_engine": true,
-    "batch_wiring_static_verified": true,
-    "batch_path": "fetch_krx_direct_raw_isolated -> fetch_krx_direct_raw",
-    "csv_prefix_rule": "HHMMSS first",
-    "old_universe_zip_backward_compatible": true,
-    "selection_order_changed": false,
-    "future_outcomes_opened": false
-  },
+  "purpose": "KRX Batch HTTP 400 diagnostics",
+  "compile": "PASS",
+  "diagnostic_static_QA": "PASS",
+  "credentials_logged": false,
+  "future_outcomes_opened": false,
+  "selection_order_changed": false,
   "live_retest_required": true
 }

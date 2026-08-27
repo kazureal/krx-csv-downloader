@@ -12,9 +12,9 @@ import pandas as pd
 import requests
 import streamlit as st
 
-from universe_engine_v0_1_12 import UniverseConfig, build_universe
+from universe_engine_v0_1_13 import UniverseConfig, build_universe
 
-st.set_page_config(page_title="Korea OHLCV CSV v1.0.12 STOCK + INDEX + UNIVERSE + BATCH", page_icon="📈")
+st.set_page_config(page_title="Korea OHLCV CSV v1.0.13 STOCK + INDEX + UNIVERSE + BATCH", page_icon="📈")
 
 H = {
     "User-Agent": "Mozilla/5.0",
@@ -433,6 +433,125 @@ def fetch_krx_direct_raw_batch(code, start, end, login_id="", login_pw=""):
 
 
 
+
+def fetch_krx_direct_raw_diagnostic(code, start, end, login_id="", login_pw=""):
+    """KRX request-shape diagnostic mirror. No credentials/outcomes are logged."""
+    session = requests.Session()
+    h = _krx_headers()
+
+    diag = {
+        "code_value": str(code),
+        "code_type": type(code).__name__,
+        "start_value": str(start),
+        "start_type": type(start).__name__,
+        "end_value": str(end),
+        "end_type": type(end).__name__,
+        "header_keys": sorted(list(h.keys())),
+        "requests": [],
+        "future_outcomes_opened": False,
+    }
+
+    try:
+        warm = session.get(KRX_REFERER, headers={"User-Agent": h.get("User-Agent", "")}, timeout=15)
+        diag["warmup_status"] = int(warm.status_code)
+        diag["warmup_content_type"] = warm.headers.get("Content-Type", "")
+    except Exception as ex:
+        diag["warmup_error"] = f"{type(ex).__name__}: {ex}"
+
+    login_diag = _krx_login(session, login_id, login_pw)
+    diag["login_attempted"] = login_diag.get("attempted")
+    diag["login_success"] = login_diag.get("success")
+
+    isin, isin_status, isin_error = _krx_find_isin(session, str(code))
+    diag["isin"] = isin
+    diag["isin_status"] = isin_status
+    diag["isin_error"] = isin_error
+    if not isin:
+        return pd.DataFrame(), diag
+
+    s = pd.Timestamp(start).date()
+    e = pd.Timestamp(end).date()
+    pieces = []
+    cur = s
+
+    while cur <= e:
+        chunk_end = min(cur + timedelta(days=699), e)
+        payload = {
+            "bld": "dbms/MDC/STAT/standard/MDCSTAT01701",
+            "isuCd": isin,
+            "strtDd": cur.strftime("%Y%m%d"),
+            "endDd": chunk_end.strftime("%Y%m%d"),
+            "adjStkPrc": "1",
+        }
+        rec = {
+            "payload": payload.copy(),
+            "payload_value_types": {k: type(v).__name__ for k, v in payload.items()},
+            "request_url": KRX_JSON_URL,
+        }
+
+        try:
+            r = session.post(KRX_JSON_URL, data=payload, headers=h, timeout=30)
+            rec["http_status"] = int(r.status_code)
+            rec["content_type"] = r.headers.get("Content-Type", "")
+            rec["response_length"] = len(r.content or b"")
+            rec["response_preview_200"] = (r.text or "").replace("\n", " ").replace("\r", " ")[:200]
+
+            try:
+                data = r.json()
+                rec["json_parse"] = "OK"
+                rec["json_top_keys"] = list(data.keys())[:20] if isinstance(data, dict) else [type(data).__name__]
+            except Exception as jex:
+                rec["json_parse"] = f"{type(jex).__name__}: {jex}"
+                diag["requests"].append(rec)
+                cur = chunk_end + timedelta(days=1)
+                time.sleep(0.20)
+                continue
+
+            rows = data.get("output") or []
+            rec["rows"] = int(len(rows))
+            if rows:
+                x = pd.DataFrame(rows)
+                required = {
+                    "TRD_DD": "date",
+                    "TDD_OPNPRC": "open",
+                    "TDD_HGPRC": "high",
+                    "TDD_LWPRC": "low",
+                    "TDD_CLSPRC": "close",
+                    "ACC_TRDVOL": "volume",
+                }
+                missing = [c for c in required if c not in x.columns]
+                rec["columns"] = x.columns.tolist()[:40]
+                rec["missing_required"] = missing
+                if not missing:
+                    y = x[list(required)].rename(columns=required)
+                    y["date"] = pd.to_datetime(y["date"], format="%Y/%m/%d", errors="coerce")
+                    for c in ["open", "high", "low", "close", "volume"]:
+                        y[c] = y[c].map(_clean_krx_num)
+                    pieces.append(y)
+        except Exception as ex:
+            rec["request_error"] = f"{type(ex).__name__}: {ex}"
+
+        diag["requests"].append(rec)
+        cur = chunk_end + timedelta(days=1)
+        time.sleep(0.20)
+
+    if not pieces:
+        return pd.DataFrame(), diag
+
+    out_df = pd.concat(pieces, ignore_index=True)
+    out_df = (
+        out_df.dropna(subset=["date", "open", "high", "low", "close", "volume"])
+        .sort_values("date")
+        .drop_duplicates("date", keep="last")
+        .reset_index(drop=True)
+    )
+    for c in ["open", "high", "low", "close", "volume"]:
+        out_df[c] = pd.to_numeric(out_df[c], errors="coerce").astype("Int64")
+    out_df["source"] = "KRX_DIRECT_RAW_DIAGNOSTIC"
+    out_df["auto_corrected"] = False
+    return out_df, diag
+
+
 def fetch_krx_direct_raw_isolated(code, start, end, login_id="", login_pw="", retries=2, retry_wait=8.0):
     """
     Batch-only isolation wrapper around the exact verified single-stock fetcher.
@@ -445,7 +564,7 @@ def fetch_krx_direct_raw_isolated(code, start, end, login_id="", login_pw="", re
 
     for attempt in range(1, int(retries) + 1):
         t0 = time.time()
-        df, diag = fetch_krx_direct_raw(
+        df, diag = fetch_krx_direct_raw_diagnostic(
             code, start, end, login_id=login_id, login_pw=login_pw
         )
         attempts.append({
@@ -573,14 +692,14 @@ def make_batch_bundle(order_slice, start_date, end_date, login_id="", login_pw="
     files[f"{filename_time_prefix()}_batch_manifest.csv"] = manifest_bytes
 
     audit_obj = {
-        "app_build": "APP_v1.0.12",
-        "engine_build": "UNIVERSE_ENGINE_v0.1.12",
+        "app_build": "APP_v1.0.13",
+        "engine_build": "UNIVERSE_ENGINE_v0.1.13",
         "batch_start_order": int(order_slice["development_selection_order"].min()),
         "batch_end_order": int(order_slice["development_selection_order"].max()),
         "requested_start": str(start_date),
         "requested_end": str(end_date),
         "stock_count": int(len(order_slice)),
-        "batch_fetch_path": "fetch_krx_direct_raw_isolated->fetch_krx_direct_raw",
+        "batch_fetch_path": "fetch_krx_direct_raw_isolated->fetch_krx_direct_raw_diagnostic",
         "future_outcomes_opened": False,
         "stocks": audit_rows,
     }
@@ -1041,13 +1160,13 @@ def make_csv_filename(name, df, partial=False):
     return f"{filename_time_prefix()}_{safe_filename_piece(name)}_{start}_{end}_생성{created}{suffix}.csv"
 
 
-st.title("Korea OHLCV CSV v1.0.12 STOCK + INDEX + UNIVERSE + BATCH")
+st.title("Korea OHLCV CSV v1.0.13 STOCK + INDEX + UNIVERSE + BATCH")
 st.caption(
     "개별주식 KRX DIRECT RAW + KOSPI/KOSDAQ 지수(FDR) + "
     "Track 02 Development Universe · 원본 보존 · outcome-blind"
 )
 
-st.caption("BUILD: APP_v1.0.12 / UNIVERSE_ENGINE_v0.1.12 / BATCH_OHLCV_v0.4")
+st.caption("BUILD: APP_v1.0.13 / UNIVERSE_ENGINE_v0.1.13 / BATCH_OHLCV_v0.5")
 
 data_kind = st.radio(
     "수집 대상",
