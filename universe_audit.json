@@ -1,0 +1,14 @@
+{
+  "title": "HRF Track 02 OOS-A Batch Input Compatibility Bundle",
+  "date": "2026-08-28",
+  "engine_build": "OOSA_SELECTION_FROZEN_20260828",
+  "reference_date": "2026-08-27",
+  "candidate_rows": 87,
+  "oos_a_stocks": 87,
+  "selection_rule": "Frozen within-stratum rank 2 representatives, spent stocks quarantined, no singleton backfill.",
+  "development_selection_order_semantics": "In this compatibility bundle, development_selection_order is the frozen OOS-A collection order 1..87.",
+  "source_development_selection_order_preserved_as": "source_development_selection_order",
+  "outcomes_opened": false,
+  "future_response_outcomes_opened": false,
+  "compatible_with_existing_batch_app": true
+}

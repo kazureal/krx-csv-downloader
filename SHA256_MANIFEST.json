@@ -1,7 +1,5 @@
 {
-  "QA_REPORT.json": "b220077931a890f0ab27dbf6765545ff73bbe5db170a3ab4fd27bd29ecc049d6",
-  "README.md": "177161bbc64be2e18c222b6dd199f758fd2bbdf04c4b9e3892f12c695aa4fd7a",
-  "app.py": "c4369d751e4b270bd80926e4e5cd42ac4e237c2628b811395c05b6e16b18d4e2",
-  "requirements.txt": "3737068413af0d9697c3853fd6cfee110f56670727265fa7bb169b1715542eef",
-  "universe_engine_v0_1_14.py": "24e2135404861628d1064cf17d100020f9ef4e948edd27be4b2e67844e6f72f9"
+  "README.txt": "68e8798cd796f0d81bfa48de74095d6f02a27ea91abda0697a7cf6dd1bf5467b",
+  "development_selection_order.csv": "52f6808b1a5ab23987d8bf5ce88617ebe1613dbe3ed8c3a77896f97d7374a38d",
+  "universe_audit.json": "80a9faa2987a2cbc601fde03f69530104a3bf61ceb611d636da2fdd67fb198ca"
 }
