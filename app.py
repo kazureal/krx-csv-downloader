@@ -1,5 +1,9 @@
 import re
 import time
+import io
+import json
+import zipfile
+import hashlib
 import xml.etree.ElementTree as ET
 from datetime import date, timedelta
 
@@ -7,7 +11,9 @@ import pandas as pd
 import requests
 import streamlit as st
 
-st.set_page_config(page_title="Korea OHLCV CSV v0.9.9 STOCK + INDEX", page_icon="📈")
+from universe_engine_v0_1 import UniverseConfig, build_universe
+
+st.set_page_config(page_title="Korea OHLCV CSV v1.0.0 STOCK + INDEX + UNIVERSE", page_icon="📈")
 
 H = {
     "User-Agent": "Mozilla/5.0",
@@ -729,231 +735,361 @@ def add_audit_columns(df):
     return out
 
 
-st.title("Korea OHLCV CSV v0.9.9 STOCK + INDEX")
-st.caption("개별주식 KRX DIRECT RAW + KOSPI/KOSDAQ 지수 일봉 · 장기기간 자동분할 · 원본 보존 · 자동보정 없음")
 
-data_kind = st.radio("수집 대상", ["개별주식", "시장지수"], horizontal=True)
+def safe_filename_piece(x):
+    x = str(x or "").strip()
+    x = re.sub(r'[\\/:*?"<>|]+', "_", x)
+    x = re.sub(r"\s+", "_", x)
+    return x.strip("._") or "UNKNOWN"
 
-if data_kind == "개별주식":
-    q = st.text_input(
-        "종목명 또는 6자리 종목코드",
-        placeholder="예: SK하이닉스, 하이닉스, 펩트론 또는 000660",
+
+def make_csv_filename(name, df, partial=False):
+    created = date.today().strftime("%Y%m%d")
+    start = pd.to_datetime(df["date"]).min().strftime("%Y%m%d")
+    end = pd.to_datetime(df["date"]).max().strftime("%Y%m%d")
+    suffix = "_PARTIAL" if partial else ""
+    return f"{safe_filename_piece(name)}_{start}_{end}_생성{created}{suffix}.csv"
+
+
+st.title("Korea OHLCV CSV v1.0.0 STOCK + INDEX + UNIVERSE")
+st.caption(
+    "개별주식 KRX DIRECT RAW + KOSPI/KOSDAQ 지수(FDR) + "
+    "Track 02 Development Universe · 원본 보존 · outcome-blind"
+)
+
+data_kind = st.radio(
+    "수집 대상",
+    ["개별주식", "시장지수", "Development Universe"],
+    horizontal=True,
+)
+
+# ---------------------------------------------------------------------
+# DEVELOPMENT UNIVERSE
+# ---------------------------------------------------------------------
+if data_kind == "Development Universe":
+    st.info(
+        "Track 02용 point-in-time 후보군을 만듭니다. "
+        "H15/MFE/MAE 등 미래 outcome은 사용하지 않습니다."
     )
-    index_sel = None
-else:
-    index_sel = st.selectbox("시장지수", list(INDEX_PRESETS.keys()), index=0)
-    q = ""
-    st.caption("KOSPI=1001 · KOSDAQ=2001. 긴 기간은 앱이 700일 이하 구간으로 자동 분할 후 병합합니다.")
-
-a, b = st.columns(2)
-with a:
-    s = st.date_input("시작일", value=date(2000, 1, 1), min_value=date(1900, 1, 1), max_value=date.today())
-with b:
-    e = st.date_input("종료일", value=date.today(), min_value=date(1900, 1, 1), max_value=date.today())
-
-if data_kind == "개별주식":
-    source_mode = st.radio(
-        "데이터 소스",
-        ["KRX DIRECT RAW (권장)", "KRX pykrx RAW (구버전 진단)", "FDR 장기이력 후보 (대조 후 승인)", "NAVER FCHART (보조/대조용)"],
-        horizontal=True,
+    ref = st.date_input(
+        "Universe 기준일",
+        value=date.today(),
+        min_value=date(2000, 1, 1),
+        max_value=date.today(),
+        key="universe_ref_date",
     )
     st.caption(
-        "KRX DIRECT는 공식 MDCSTAT01701에 adjStkPrc=1(단순/비수정)로 요청합니다. "
-        "빈 응답이면 선택적 KRX 로그인으로 다시 확인할 수 있습니다."
+        "고정 설계: KOSPI+KOSDAQ · KRX 업종 · 시장별 시총 tercile · "
+        "직전 20거래일 중위 거래대금 · ticker-stable round-robin"
     )
-    with st.expander("KRX 로그인 (선택 사항 — 빈 응답일 때만 사용)", expanded=False):
-        st.caption(
-            "ID/비밀번호는 이 앱 실행 중 KRX 로그인 요청에만 사용하며 CSV/로그에 저장하지 않습니다. "
-            "채팅에는 절대 보내지 마세요."
-        )
-        krx_id = st.text_input("KRX ID", value="", key="krx_id")
-        krx_pw = st.text_input("KRX 비밀번호", value="", type="password", key="krx_pw")
-else:
-    source_mode = "KRX INDEX"
-    krx_id = ""
-    krx_pw = ""
-    st.info("시장지수는 FinanceDataReader 지수 전용 경로를 사용합니다. 개별주식 KRX DIRECT RAW와 완전히 분리하며, CSV의 source에는 FDR_INDEX라고 명시합니다.")
 
-if st.button("OHLCV CSV 만들기", type="primary", use_container_width=True):
-    if s > e:
-        st.error("날짜 범위를 확인하세요.")
-        st.stop()
+    if st.button("Point-in-Time Universe 만들기", type="primary", use_container_width=True):
+        prog = st.progress(0, text="Universe 준비 중")
 
-    index_diag = None
-    if data_kind == "개별주식":
-        x = resolve(q)
-        if not x:
-            st.error("종목을 찾지 못했습니다. 종목명 또는 6자리 코드를 확인해 주세요.")
+        def cb(p, msg):
+            prog.progress(min(max(float(p), 0.0), 1.0), text=msg)
+
+        try:
+            full, ordered, diag = build_universe(ref, UniverseConfig(), progress=cb)
+        except Exception as ex:
+            prog.empty()
+            st.error(f"Universe 생성 실패: {type(ex).__name__}: {ex}")
             st.stop()
-    else:
-        x = INDEX_PRESETS[index_sel].copy()
 
-    try:
-        diagnostics = None
-        direct_diag = None
-        fdr_diag = None
-        if data_kind == "시장지수":
-            df, index_diag = fetch_krx_index(x["code"], x["name"], s, e)
-        elif source_mode.startswith("KRX DIRECT"):
-            df, direct_diag = fetch_krx_direct_raw(x["code"], s, e, krx_id, krx_pw)
-        elif source_mode.startswith("KRX pykrx"):
-            df, diagnostics = fetch_krx_raw(x["code"], s, e)
-        elif source_mode.startswith("FDR"):
-            df, fdr_diag = fetch_fdr_candidate(x["code"], s, e)
-        else:
-            df = fetch_naver_fchart(x["code"], s, e)
-    except Exception as ex:
-        st.error(f"수집 실패: {type(ex).__name__}: {ex}")
-        st.stop()
+        prog.empty()
+        if full.empty:
+            st.error("KRX/pykrx에서 universe를 가져오지 못했습니다.")
+            st.json(diag)
+            st.stop()
 
-    if index_diag is not None:
-        st.write(f"지수: **{x['name']} ({x['code']})**")
-        st.write(f"pykrx 버전: **{index_diag.get('pykrx_version', 'unknown')}**")
-        idf = pd.DataFrame(index_diag.get("chunks", []))
-        if not idf.empty:
-            with st.expander("KRX INDEX 자동분할 수집 로그", expanded=True):
-                st.dataframe(idf, use_container_width=True, hide_index=True)
-                ok = int((idf["status"] == "INDEX_OK").sum())
-                empty = int((idf["status"] == "INDEX_EMPTY").sum())
-                err = int((idf["status"] == "INDEX_ERROR").sum())
-                st.write(f"성공 구간: **{ok}** / 빈 구간: **{empty}** / 오류 구간: **{err}**")
-        if index_diag.get("status") != "INDEX_OK":
-            st.warning("지수 수집 구간 중 실패가 있습니다. 실패 로그를 확인하고 완성 데이터로 사용하지 마세요.")
-
-    if direct_diag is not None:
-        st.write(f"종목 해석: **{x['name']} ({x['code']})**")
-        st.write(
-            f"KRX issue code: **{direct_diag.get('isin','(없음)')}** "
-            f"({direct_diag.get('isin_status','')})"
+        st.success(
+            f"기준 영업일 {diag.get('resolved_reference_business_day')} · "
+            f"snapshot {len(full):,}종목 · common-stock candidate "
+            f"{int(full['eligible_common_candidate'].sum()):,}종목"
         )
-        if direct_diag.get("login_attempted"):
-            if direct_diag.get("login_success"):
-                st.success("KRX 로그인 성공")
-            else:
-                st.warning(
-                    f"KRX 로그인 실패: {direct_diag.get('login_code','')} "
-                    f"{direct_diag.get('login_message','')}"
-                )
-        else:
-            st.info("익명 KRX 세션으로 조회했습니다.")
 
-        ddf = pd.DataFrame(direct_diag.get("chunks", []))
-        if not ddf.empty:
-            with st.expander("KRX DIRECT 분할수집 로그", expanded=True):
-                st.dataframe(ddf, use_container_width=True, hide_index=True)
-                ok = int((ddf["status"] == "RAW_OK").sum())
-                empty = int((ddf["status"] == "RAW_EMPTY").sum())
-                er = int((~ddf["status"].isin(["RAW_OK", "RAW_EMPTY"])).sum())
-                st.write(f"RAW 성공 구간: **{ok}** / 빈 구간: **{empty}** / 기타 오류: **{er}**")
-
-        if direct_diag.get("isin_error") and direct_diag.get("isin_status") == "KNOWN_FALLBACK":
-            st.caption(f"finder 응답이 없어 검증된 ISIN fallback 사용: {direct_diag.get('isin_error')}")
-
-    if fdr_diag is not None:
-        st.write(f"종목 해석: **{x['name']} ({x['code']})**")
-        st.write(f"FinanceDataReader 버전: **{fdr_diag.get('fdr_version', 'unknown')}**")
-        st.write(
-            f"FDR 상태: **{fdr_diag.get('status','')}** / "
-            f"최종 반환 행: **{fdr_diag.get('returned_rows', 0)}**"
-        )
-        if fdr_diag.get("actual_start"):
-            st.write(
-                f"실제 범위: **{fdr_diag.get('actual_start')} ~ {fdr_diag.get('actual_end')}**"
+        if diag.get("errors"):
+            st.warning(
+                f"수집 오류 {len(diag['errors'])}건. audit JSON을 확인하고 "
+                "불완전 데이터로 final selection을 진행하지 마세요."
             )
+            with st.expander("Universe 오류 로그"):
+                st.dataframe(pd.DataFrame(diag["errors"]), use_container_width=True, hide_index=True)
 
-        cdf = pd.DataFrame(fdr_diag.get("chunks", []))
-        if not cdf.empty:
-            with st.expander("FDR 5년 분할수집 로그", expanded=True):
-                st.dataframe(cdf, use_container_width=True, hide_index=True)
-                ok = int((cdf["status"] == "FDR_OK").sum())
-                empty = int((cdf["status"] == "FDR_EMPTY").sum())
-                err = int((cdf["status"] == "FDR_ERROR").sum())
-                st.write(f"성공 구간: **{ok}** / 빈 구간: **{empty}** / 오류 구간: **{err}**")
-
-        st.warning(
-            "FDR 데이터는 현재 '장기이력 후보'입니다. "
-            "기존 검증 원자료와 중첩구간 OHLCV를 대조하기 전에는 HRF OOS에 사용하지 않습니다."
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("전체 snapshot", f"{len(full):,}")
+        c2.metric("Eligible", f"{int(full['eligible_common_candidate'].sum()):,}")
+        c3.metric(
+            "KOSPI eligible",
+            f"{int(((full.market=='KOSPI') & full.eligible_common_candidate).sum()):,}",
+        )
+        c4.metric(
+            "KOSDAQ eligible",
+            f"{int(((full.market=='KOSDAQ') & full.eligible_common_candidate).sum()):,}",
         )
 
-    if diagnostics is not None:
-        st.write(f"종목 해석: **{x['name']} ({x['code']})**")
-        st.write(f"pykrx 버전: **{diagnostics.get('pykrx_version', 'unknown')}**")
+        st.subheader("Deterministic Development Selection Order")
+        show_cols = [
+            "development_selection_order", "ticker", "name", "market", "sector",
+            "market_cap", "median_trading_value_20d", "market_cap_bucket",
+            "liquidity_bucket", "selection_stratum", "classification_review_flag",
+        ]
+        st.dataframe(ordered[show_cols].head(200), use_container_width=True, hide_index=True)
+        st.caption("화면에는 앞 200개만 표시하고, 다운로드 ZIP에는 전체 순서를 저장합니다.")
 
-        ddf = pd.DataFrame(diagnostics.get("chunks", []))
-        if not ddf.empty:
-            with st.expander("KRX 수집 진단 로그", expanded=True):
-                st.dataframe(ddf, use_container_width=True, hide_index=True)
-                raw_ok = int((ddf["status"] == "RAW_OK").sum())
-                raw_empty_adj = int((ddf["status"] == "RAW_EMPTY_ADJ_EXISTS").sum())
-                raw_err = int((ddf["status"] == "RAW_ERROR").sum())
-                st.write(
-                    f"RAW 성공 구간: **{raw_ok}** / "
-                    f"RAW 비었지만 adjusted probe 존재: **{raw_empty_adj}** / "
-                    f"RAW 오류 구간: **{raw_err}**"
-                )
+        full_out = full.copy()
+        ordered_out = ordered.copy()
+        if "reference_date" in full_out:
+            full_out["reference_date"] = pd.to_datetime(full_out["reference_date"]).dt.strftime("%Y-%m-%d")
+        if "reference_date" in ordered_out:
+            ordered_out["reference_date"] = pd.to_datetime(ordered_out["reference_date"]).dt.strftime("%Y-%m-%d")
 
-    if df.empty:
-        st.error("선택한 소스에서 데이터가 없습니다. 위 진단 상태를 확인해 주세요.")
-        if data_kind == "시장지수":
-            st.info("지수 데이터 경로가 비었습니다. 분할수집 로그의 method/error를 확인하세요.")
-        elif source_mode.startswith("KRX DIRECT"):
-            if not krx_id:
-                st.info(
-                    "익명 KRX 조회가 빈 응답이면 위 'KRX 로그인'을 열어 "
-                    "본인의 KRX 계정으로 다시 시도하세요. ID/비밀번호는 채팅에 보내지 마세요."
-                )
-            else:
-                st.info(
-                    "로그인까지 성공했는데도 비면 KRX의 과거 데이터 제공 범위/권한 문제로 판단합니다."
-                )
-        elif source_mode.startswith("KRX pykrx"):
-            st.info(
-                "중요: adjusted=True probe는 '데이터 존재 여부' 진단용일 뿐이며, "
-                "CSV에는 사용하지 않습니다."
-            )
-        st.stop()
+        full_bytes = full_out.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+        order_bytes = ordered_out.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+        audit_bytes = json.dumps(diag, ensure_ascii=False, indent=2, default=str).encode("utf-8")
 
-    df = add_index_audit_columns(df) if data_kind == "시장지수" else add_audit_columns(df)
-    actual_start = df.date.min().date()
-    actual_end = df.date.max().date()
-    warning_n = int((df.ohlc_warning != "").sum())
-    invalid_n = int((~df.valid_session).sum())
+        manifest = {
+            "universe_snapshot.csv": hashlib.sha256(full_bytes).hexdigest(),
+            "development_selection_order.csv": hashlib.sha256(order_bytes).hexdigest(),
+            "universe_audit.json": hashlib.sha256(audit_bytes).hexdigest(),
+        }
+        manifest_bytes = json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8")
 
-    label = "지수" if data_kind == "시장지수" else "종목"
-    st.success(f'{x["name"]} ({x["code"]}) · {len(df):,}행 수집')
-    st.write(f"실제 수집기간: {actual_start} ~ {actual_end}")
-    st.write(f"소스: {df['source'].iloc[0]}")
+        bio = io.BytesIO()
+        with zipfile.ZipFile(bio, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("universe_snapshot.csv", full_bytes)
+            zf.writestr("development_selection_order.csv", order_bytes)
+            zf.writestr("universe_audit.json", audit_bytes)
+            zf.writestr("SHA256_MANIFEST.json", manifest_bytes)
 
-    # 요청 범위를 서버가 다 주지 못했는지 명확하게 경고한다.
-    if actual_start > s:
-        st.warning(
-            f"요청 시작일은 {s}이지만 첫 수집일은 {actual_start}입니다. "
-            "데이터 공급원/상장·기업행위 이력/조회 제한을 확인하세요. 부족한 과거 구간을 자동 생성하지 않습니다."
-        )
-    if actual_end < e - timedelta(days=7):
-        st.warning(f"요청 종료일 {e}보다 실제 마지막 수집일 {actual_end}이 이릅니다.")
+        resolved = diag.get("resolved_reference_business_day", ref.strftime("%Y%m%d"))
+        created = date.today().strftime("%Y%m%d")
+        universe_filename = f"UNIVERSE_기준{resolved}_생성{created}.zip"
 
-    if warning_n:
-        st.warning(f"원본 OHLC 관계 이상: {warning_n:,}행 — 값은 수정하지 않았습니다.")
-        st.dataframe(
-            df.loc[df.ohlc_warning != "", ["date", "open", "high", "low", "close", "volume", "ohlc_warning"]],
+        st.download_button(
+            "Universe Audit Bundle ZIP 다운로드",
+            bio.getvalue(),
+            file_name=universe_filename,
+            mime="application/zip",
             use_container_width=True,
-            hide_index=True,
+        )
+        st.caption(
+            "Safari 다운로드 위치를 '나의 iPhone/GPT/주식시세추이'로 지정했다면 "
+            "위 ZIP은 그 폴더로 저장됩니다."
         )
 
-    if invalid_n:
-        st.info(f"HRF valid_session 제외 대상: {invalid_n:,}행 — 원본 행은 CSV에 보존됩니다.")
+# ---------------------------------------------------------------------
+# STOCK / INDEX — existing v0.9.9 data paths preserved
+# ---------------------------------------------------------------------
+else:
+    if data_kind == "개별주식":
+        q = st.text_input(
+            "종목명 또는 6자리 종목코드",
+            placeholder="예: SK하이닉스, 하이닉스, 펩트론 또는 000660",
+        )
+        index_sel = None
+    else:
+        index_sel = st.selectbox("시장지수", list(INDEX_PRESETS.keys()), index=0)
+        q = ""
+        st.caption("KOSPI=1001 · KOSDAQ=2001. 시장지수는 FinanceDataReader 전용 경로를 사용합니다.")
 
-    z = df.copy()
-    z["date"] = z.date.dt.strftime("%Y-%m-%d")
-    payload = z.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
-    st.download_button(
-        "CSV 다운로드",
-        payload,
-        (f'{x["name"]}_{df.date.min():%Y%m%d}_{df.date.max():%Y%m%d}_index'
-         f'{"_PARTIAL" if index_diag and index_diag.get("status") != "INDEX_OK" else ""}.csv'
-         if data_kind == "시장지수"
-         else f'{x["code"]}_{df.date.min():%Y%m%d}_{df.date.max():%Y%m%d}_ohlcv.csv'),
-        "text/csv",
-        use_container_width=True,
-    )
+    a, b = st.columns(2)
+    with a:
+        s = st.date_input(
+            "시작일", value=date(2000, 1, 1),
+            min_value=date(1900, 1, 1), max_value=date.today(),
+        )
+    with b:
+        e = st.date_input(
+            "종료일", value=date.today(),
+            min_value=date(1900, 1, 1), max_value=date.today(),
+        )
+
+    if data_kind == "개별주식":
+        source_mode = st.radio(
+            "데이터 소스",
+            [
+                "KRX DIRECT RAW (권장)",
+                "KRX pykrx RAW (구버전 진단)",
+                "FDR 장기이력 후보 (대조 후 승인)",
+                "NAVER FCHART (보조/대조용)",
+            ],
+            horizontal=True,
+        )
+        st.caption(
+            "KRX DIRECT는 공식 MDCSTAT01701에 adjStkPrc=1(단순/비수정)로 요청합니다. "
+            "빈 응답이면 선택적 KRX 로그인으로 다시 확인할 수 있습니다."
+        )
+        with st.expander("KRX 로그인 (선택 사항 — 빈 응답일 때만 사용)", expanded=False):
+            st.caption(
+                "ID/비밀번호는 이 앱 실행 중 KRX 로그인 요청에만 사용하며 CSV/로그에 저장하지 않습니다. "
+                "채팅에는 절대 보내지 마세요."
+            )
+            krx_id = st.text_input("KRX ID", value="", key="krx_id")
+            krx_pw = st.text_input("KRX 비밀번호", value="", type="password", key="krx_pw")
+    else:
+        source_mode = "KRX INDEX"
+        krx_id = ""
+        krx_pw = ""
+        st.info(
+            "시장지수는 FinanceDataReader 지수 전용 경로를 사용합니다. "
+            "개별주식 KRX DIRECT RAW와 완전히 분리하며 source=FDR_INDEX로 기록합니다."
+        )
+
+    if st.button("OHLCV CSV 만들기", type="primary", use_container_width=True):
+        if s > e:
+            st.error("날짜 범위를 확인하세요.")
+            st.stop()
+
+        index_diag = None
+        if data_kind == "개별주식":
+            x = resolve(q)
+            if not x:
+                st.error("종목을 찾지 못했습니다. 종목명 또는 6자리 종목코드를 확인해 주세요.")
+                st.stop()
+        else:
+            x = INDEX_PRESETS[index_sel].copy()
+
+        try:
+            diagnostics = None
+            direct_diag = None
+            fdr_diag = None
+            if data_kind == "시장지수":
+                df, index_diag = fetch_krx_index(x["code"], x["name"], s, e)
+            elif source_mode.startswith("KRX DIRECT"):
+                df, direct_diag = fetch_krx_direct_raw(x["code"], s, e, krx_id, krx_pw)
+            elif source_mode.startswith("KRX pykrx"):
+                df, diagnostics = fetch_krx_raw(x["code"], s, e)
+            elif source_mode.startswith("FDR"):
+                df, fdr_diag = fetch_fdr_candidate(x["code"], s, e)
+            else:
+                df = fetch_naver_fchart(x["code"], s, e)
+        except Exception as ex:
+            st.error(f"수집 실패: {type(ex).__name__}: {ex}")
+            st.stop()
+
+        if index_diag is not None:
+            st.write(f"지수: **{x['name']} ({x['code']})**")
+            st.write(f"FinanceDataReader 버전: **{index_diag.get('fdr_version', 'unknown')}**")
+            idf = pd.DataFrame(index_diag.get("chunks", []))
+            if not idf.empty:
+                with st.expander("FDR INDEX 자동분할 수집 로그", expanded=True):
+                    st.dataframe(idf, use_container_width=True, hide_index=True)
+                    ok = int((idf["status"] == "INDEX_OK").sum())
+                    empty = int((idf["status"] == "INDEX_EMPTY").sum())
+                    err = int((idf["status"] == "INDEX_ERROR").sum())
+                    st.write(f"성공 구간: **{ok}** / 빈 구간: **{empty}** / 오류 구간: **{err}**")
+            if index_diag.get("status") != "INDEX_OK":
+                st.warning("지수 수집 구간 중 실패가 있습니다. 완성 데이터로 사용하지 마세요.")
+
+        if direct_diag is not None:
+            st.write(f"종목 해석: **{x['name']} ({x['code']})**")
+            st.write(
+                f"KRX issue code: **{direct_diag.get('isin','(없음)')}** "
+                f"({direct_diag.get('isin_status','')})"
+            )
+            if direct_diag.get("login_attempted"):
+                if direct_diag.get("login_success"):
+                    st.success("KRX 로그인 성공")
+                else:
+                    st.warning(
+                        f"KRX 로그인 실패: {direct_diag.get('login_code','')} "
+                        f"{direct_diag.get('login_message','')}"
+                    )
+            else:
+                st.info("익명 KRX 세션으로 조회했습니다.")
+
+            ddf = pd.DataFrame(direct_diag.get("chunks", []))
+            if not ddf.empty:
+                with st.expander("KRX DIRECT 분할수집 로그", expanded=True):
+                    st.dataframe(ddf, use_container_width=True, hide_index=True)
+                    ok = int((ddf["status"] == "RAW_OK").sum())
+                    empty = int((ddf["status"] == "RAW_EMPTY").sum())
+                    er = int((~ddf["status"].isin(["RAW_OK", "RAW_EMPTY"])).sum())
+                    st.write(f"RAW 성공 구간: **{ok}** / 빈 구간: **{empty}** / 기타 오류: **{er}**")
+
+            if direct_diag.get("isin_error") and direct_diag.get("isin_status") == "KNOWN_FALLBACK":
+                st.caption(f"finder 응답이 없어 검증된 ISIN fallback 사용: {direct_diag.get('isin_error')}")
+
+        if fdr_diag is not None:
+            st.write(f"종목 해석: **{x['name']} ({x['code']})**")
+            st.write(f"FinanceDataReader 버전: **{fdr_diag.get('fdr_version', 'unknown')}**")
+            st.write(
+                f"FDR 상태: **{fdr_diag.get('status','')}** / "
+                f"최종 반환 행: **{fdr_diag.get('returned_rows', 0)}**"
+            )
+            if fdr_diag.get("actual_start"):
+                st.write(
+                    f"실제 범위: **{fdr_diag.get('actual_start')} ~ {fdr_diag.get('actual_end')}**"
+                )
+            cdf = pd.DataFrame(fdr_diag.get("chunks", []))
+            if not cdf.empty:
+                with st.expander("FDR 5년 분할수집 로그", expanded=True):
+                    st.dataframe(cdf, use_container_width=True, hide_index=True)
+            st.warning(
+                "FDR 데이터는 현재 '장기이력 후보'입니다. "
+                "기존 검증 원자료와 중첩구간 OHLCV를 대조하기 전에는 HRF OOS에 사용하지 않습니다."
+            )
+
+        if diagnostics is not None:
+            st.write(f"종목 해석: **{x['name']} ({x['code']})**")
+            st.write(f"pykrx 버전: **{diagnostics.get('pykrx_version', 'unknown')}**")
+            ddf = pd.DataFrame(diagnostics.get("chunks", []))
+            if not ddf.empty:
+                with st.expander("KRX 수집 진단 로그", expanded=True):
+                    st.dataframe(ddf, use_container_width=True, hide_index=True)
+
+        if df.empty:
+            st.error("선택한 소스에서 데이터가 없습니다. 위 진단 상태를 확인해 주세요.")
+            st.stop()
+
+        df = add_index_audit_columns(df) if data_kind == "시장지수" else add_audit_columns(df)
+        actual_start = df.date.min().date()
+        actual_end = df.date.max().date()
+        warning_n = int((df.ohlc_warning != "").sum())
+        invalid_n = int((~df.valid_session).sum())
+
+        st.success(f'{x["name"]} ({x["code"]}) · {len(df):,}행 수집')
+        st.write(f"실제 수집기간: {actual_start} ~ {actual_end}")
+        st.write(f"소스: {df['source'].iloc[0]}")
+
+        if actual_start > s:
+            st.warning(
+                f"요청 시작일은 {s}이지만 첫 수집일은 {actual_start}입니다. "
+                "부족한 과거 구간을 자동 생성하지 않습니다."
+            )
+        if actual_end < e - timedelta(days=7):
+            st.warning(f"요청 종료일 {e}보다 실제 마지막 수집일 {actual_end}이 이릅니다.")
+
+        if warning_n:
+            st.warning(f"원본 OHLC 관계 이상: {warning_n:,}행 — 값은 수정하지 않았습니다.")
+            st.dataframe(
+                df.loc[
+                    df.ohlc_warning != "",
+                    ["date", "open", "high", "low", "close", "volume", "ohlc_warning"],
+                ],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        if invalid_n:
+            st.info(f"HRF valid_session 제외 대상: {invalid_n:,}행 — 원본 행은 CSV에 보존됩니다.")
+
+        z = df.copy()
+        z["date"] = z.date.dt.strftime("%Y-%m-%d")
+        payload = z.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+
+        partial = bool(index_diag and index_diag.get("status") != "INDEX_OK")
+        filename = make_csv_filename(x["name"], df, partial=partial)
+
+        st.download_button(
+            "CSV 다운로드",
+            payload,
+            file_name=filename,
+            mime="text/csv",
+            use_container_width=True,
+        )
+        st.caption(
+            f"파일명: {filename} · Safari 기본 다운로드 위치를 "
+            "'나의 iPhone/GPT/주식시세추이'로 지정했다면 그 폴더에 저장됩니다."
+        )

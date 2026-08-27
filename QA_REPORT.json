@@ -1,0 +1,14 @@
+{
+  "version": "1.0.0",
+  "date": "2026-08-27",
+  "checks": {
+    "compile_app": true,
+    "compile_universe_engine": true,
+    "stock_index_filename_format": "NAME_ACTUALSTART_ACTUALEND_CREATEDATE",
+    "universe_mode_present": true,
+    "v0.9.9_FDR_INDEX_path_preserved": true,
+    "KRX_DIRECT_RAW_path_preserved": true,
+    "universe_future_outcome_data_access": false
+  },
+  "note": "Universe code contains warning text mentioning H15/MFE/MAE, but no future-response dataset or response column is read. Syntax/compile verified; live Streamlit/KRX execution must be checked in deployment."
+}
