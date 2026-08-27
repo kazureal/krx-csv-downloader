@@ -7,7 +7,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-st.set_page_config(page_title="Korea OHLCV CSV v0.9.3 FDR SPLIT", page_icon="📈")
+st.set_page_config(page_title="Korea OHLCV CSV v0.9.4 KRX DIRECT RAW", page_icon="📈")
 
 H = {
     "User-Agent": "Mozilla/5.0",
@@ -32,6 +32,18 @@ REV = {
     "950160": "코오롱티슈진",
     "000660": "SK하이닉스",
 }
+
+# KRX issue code(ISIN) fallback.
+# 000660은 SK hynix 공식 IR에서 확인한 현재 ISIN.
+KNOWN_ISIN = {
+    "000660": "KR7000660001",
+}
+
+KRX_JSON_URL = "https://data.krx.co.kr/comm/bldAttendant/getJsonData.cmd"
+KRX_LOGIN_PAGE = "https://data.krx.co.kr/contents/MDC/COMS/client/MDCCOMS001.cmd"
+KRX_LOGIN_JSP = "https://data.krx.co.kr/contents/MDC/COMS/client/view/login.jsp?site=mdc"
+KRX_LOGIN_URL = "https://data.krx.co.kr/contents/MDC/COMS/client/MDCCOMS001D1.cmd"
+KRX_REFERER = "https://data.krx.co.kr/contents/MDC/MDI/outerLoader/index.cmd"
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -92,6 +104,210 @@ def _standardize(df, source):
     out["source"] = source
     out["auto_corrected"] = False
     return out.sort_values("date").drop_duplicates("date", keep="last").reset_index(drop=True)
+
+
+
+def _krx_headers():
+    return {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/131.0.0.0 Safari/537.36"
+        ),
+        "Referer": KRX_REFERER,
+        "X-Requested-With": "XMLHttpRequest",
+        "Accept-Language": "ko-KR,ko;q=0.9,en;q=0.7",
+    }
+
+
+def _krx_login(session, login_id, login_pw):
+    """선택적 KRX 로그인. ID/PW는 저장/CSV출력/로그표시하지 않는다."""
+    diag = {"attempted": False, "success": False, "code": "", "message": ""}
+    if not (login_id and login_pw):
+        return diag
+
+    diag["attempted"] = True
+    h = _krx_headers()
+    try:
+        session.get(KRX_LOGIN_PAGE, headers={"User-Agent": h["User-Agent"]}, timeout=15)
+        session.get(
+            KRX_LOGIN_JSP,
+            headers={"User-Agent": h["User-Agent"], "Referer": KRX_LOGIN_PAGE},
+            timeout=15,
+        )
+        payload = {
+            "mbrNm": "", "telNo": "", "di": "", "certType": "",
+            "mbrId": login_id, "pw": login_pw,
+        }
+        r = session.post(
+            KRX_LOGIN_URL,
+            data=payload,
+            headers={"User-Agent": h["User-Agent"], "Referer": KRX_LOGIN_PAGE},
+            timeout=20,
+        )
+        data = r.json()
+        code = str(data.get("_error_code", ""))
+        msg = str(data.get("_error_message", ""))
+        if code == "CD011":  # 중복 로그인
+            payload["skipDup"] = "Y"
+            r = session.post(
+                KRX_LOGIN_URL,
+                data=payload,
+                headers={"User-Agent": h["User-Agent"], "Referer": KRX_LOGIN_PAGE},
+                timeout=20,
+            )
+            data = r.json()
+            code = str(data.get("_error_code", ""))
+            msg = str(data.get("_error_message", ""))
+        diag.update({"success": code == "CD001", "code": code, "message": msg})
+    except Exception as ex:
+        diag.update({"success": False, "code": "EXCEPTION", "message": f"{type(ex).__name__}: {ex}"})
+    return diag
+
+
+def _krx_find_isin(session, code):
+    # 1) 공식 finder에서 6자리 코드 -> full_code(ISIN)
+    payload = {
+        "bld": "dbms/comm/finder/finder_stkisu",
+        "locale": "ko_KR",
+        "mktsel": "ALL",
+        "searchText": code,
+        "typeNo": "0",
+    }
+    try:
+        r = session.post(KRX_JSON_URL, data=payload, headers=_krx_headers(), timeout=20)
+        data = r.json()
+        rows = data.get("block1") or []
+        for row in rows:
+            if str(row.get("short_code", "")).zfill(6) == code:
+                full = str(row.get("full_code", "")).strip()
+                if full:
+                    return full, "FINDER_OK", ""
+    except Exception as ex:
+        finder_error = f"{type(ex).__name__}: {ex}"
+    else:
+        finder_error = "finder returned no exact match"
+
+    # 2) 검증된 fallback
+    if code in KNOWN_ISIN:
+        return KNOWN_ISIN[code], "KNOWN_FALLBACK", finder_error
+    return "", "ISIN_NOT_FOUND", finder_error
+
+
+def _clean_krx_num(v):
+    s = str(v).replace(",", "").replace(" ", "").strip()
+    if s in ("", "-", "None", "nan"):
+        return None
+    return pd.to_numeric(s, errors="coerce")
+
+
+def fetch_krx_direct_raw(code, start, end, login_id="", login_pw=""):
+    """
+    KRX Data Marketplace 직접 경로:
+      finder_stkisu -> isuCd(ISIN)
+      MDCSTAT01701 -> adjStkPrc=1 (단순/비수정 가격)
+    700일 단위 분할. 로그인 정보는 메모리에서만 사용하며 저장하지 않는다.
+    """
+    session = requests.Session()
+    h = _krx_headers()
+
+    # 익명 세션도 먼저 warm-up
+    try:
+        session.get(KRX_REFERER, headers={"User-Agent": h["User-Agent"]}, timeout=15)
+    except Exception:
+        pass
+
+    login_diag = _krx_login(session, login_id, login_pw)
+    isin, isin_status, isin_error = _krx_find_isin(session, code)
+
+    diag = {
+        "code": code,
+        "requested_start": str(start),
+        "requested_end": str(end),
+        "login_attempted": login_diag["attempted"],
+        "login_success": login_diag["success"],
+        "login_code": login_diag["code"],
+        "login_message": login_diag["message"],
+        "isin": isin,
+        "isin_status": isin_status,
+        "isin_error": isin_error,
+        "chunks": [],
+    }
+    if not isin:
+        return _standardize(pd.DataFrame(), "KRX_DIRECT_RAW"), diag
+
+    pieces = []
+    cur = start
+    while cur <= end:
+        chunk_end = min(cur + timedelta(days=699), end)
+        rec = {
+            "start": str(cur),
+            "end": str(chunk_end),
+            "http": "",
+            "rows": 0,
+            "status": "",
+            "krx_error_code": "",
+            "krx_error_message": "",
+            "error": "",
+        }
+        payload = {
+            "bld": "dbms/MDC/STAT/standard/MDCSTAT01701",
+            "isuCd": isin,
+            "strtDd": cur.strftime("%Y%m%d"),
+            "endDd": chunk_end.strftime("%Y%m%d"),
+            "adjStkPrc": "1",  # 1=단순종가(비수정), 2=수정종가
+        }
+        try:
+            r = session.post(KRX_JSON_URL, data=payload, headers=h, timeout=30)
+            rec["http"] = str(r.status_code)
+            data = r.json()
+            rec["krx_error_code"] = str(data.get("_error_code", ""))
+            rec["krx_error_message"] = str(data.get("_error_message", ""))
+            rows = data.get("output") or []
+            rec["rows"] = int(len(rows))
+            if rows:
+                x = pd.DataFrame(rows)
+                rename = {
+                    "TRD_DD": "date",
+                    "TDD_OPNPRC": "open",
+                    "TDD_HGPRC": "high",
+                    "TDD_LWPRC": "low",
+                    "TDD_CLSPRC": "close",
+                    "ACC_TRDVOL": "volume",
+                }
+                missing = [c for c in rename if c not in x.columns]
+                if missing:
+                    rec["status"] = "SCHEMA_ERROR"
+                    rec["error"] = f"missing={missing}; columns={x.columns.tolist()[:20]}"
+                else:
+                    x = x[list(rename)].rename(columns=rename)
+                    x["date"] = pd.to_datetime(x["date"], format="%Y/%m/%d", errors="coerce")
+                    for c in ["open", "high", "low", "close", "volume"]:
+                        x[c] = x[c].map(_clean_krx_num)
+                    pieces.append(x)
+                    rec["status"] = "RAW_OK"
+            else:
+                if rec["krx_error_code"]:
+                    rec["status"] = "KRX_ERROR_RESPONSE"
+                elif login_diag["attempted"] and not login_diag["success"]:
+                    rec["status"] = "LOGIN_FAILED_EMPTY"
+                else:
+                    rec["status"] = "RAW_EMPTY"
+        except Exception as ex:
+            rec["status"] = "REQUEST_ERROR"
+            rec["error"] = f"{type(ex).__name__}: {ex}"
+
+        diag["chunks"].append(rec)
+        cur = chunk_end + timedelta(days=1)
+        time.sleep(0.25)
+
+    if not pieces:
+        return _standardize(pd.DataFrame(), "KRX_DIRECT_RAW"), diag
+
+    raw = pd.concat(pieces, ignore_index=True)
+    raw = raw.dropna(subset=["date", "open", "high", "low", "close", "volume"])
+    out = _standardize(raw, "KRX_DIRECT_RAW")
+    return out, diag
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -320,8 +536,8 @@ def add_audit_columns(df):
     return out
 
 
-st.title("Korea OHLCV CSV v0.9.3 FDR SPLIT")
-st.caption("FDR 5년 분할수집 + KRX RAW 진단 · 원본 보존 · 자동보정 없음 · 연구 승인 전 소스 대조")
+st.title("Korea OHLCV CSV v0.9.4 KRX DIRECT RAW")
+st.caption("KRX 직접 비수정 OHLCV · 선택적 KRX 로그인 · FDR/NAVER 대조 · 원본 보존 · 자동보정 없음")
 
 q = st.text_input(
     "종목명 또는 6자리 종목코드",
@@ -336,15 +552,22 @@ with b:
 
 source_mode = st.radio(
     "데이터 소스",
-    ["KRX RAW (진단)", "FDR 장기이력 후보 (대조 후 승인)", "NAVER FCHART (보조/대조용)"],
+    ["KRX DIRECT RAW (권장)", "KRX pykrx RAW (구버전 진단)", "FDR 장기이력 후보 (대조 후 승인)", "NAVER FCHART (보조/대조용)"],
     horizontal=True,
 )
 
 st.caption(
-    "진단 상태: RAW_OK=비수정 데이터 성공 / "
-    "RAW_EMPTY_ADJ_EXISTS=비수정은 비었지만 수정주가 계열은 존재 / "
-    "RAW_ERROR=KRX 호출 자체 오류"
+    "KRX DIRECT는 공식 MDCSTAT01701에 adjStkPrc=1(단순/비수정)로 요청합니다. "
+    "빈 응답이면 선택적 KRX 로그인으로 다시 확인할 수 있습니다."
 )
+
+with st.expander("KRX 로그인 (선택 사항 — 빈 응답일 때만 사용)", expanded=False):
+    st.caption(
+        "ID/비밀번호는 이 앱 실행 중 KRX 로그인 요청에만 사용하며 CSV/로그에 저장하지 않습니다. "
+        "채팅에는 절대 보내지 마세요."
+    )
+    krx_id = st.text_input("KRX ID", value="", key="krx_id")
+    krx_pw = st.text_input("KRX 비밀번호", value="", type="password", key="krx_pw")
 
 if st.button("OHLCV CSV 만들기", type="primary", use_container_width=True):
     if s > e:
@@ -358,8 +581,11 @@ if st.button("OHLCV CSV 만들기", type="primary", use_container_width=True):
 
     try:
         diagnostics = None
+        direct_diag = None
         fdr_diag = None
-        if source_mode.startswith("KRX"):
+        if source_mode.startswith("KRX DIRECT"):
+            df, direct_diag = fetch_krx_direct_raw(x["code"], s, e, krx_id, krx_pw)
+        elif source_mode.startswith("KRX pykrx"):
             df, diagnostics = fetch_krx_raw(x["code"], s, e)
         elif source_mode.startswith("FDR"):
             df, fdr_diag = fetch_fdr_candidate(x["code"], s, e)
@@ -368,6 +594,35 @@ if st.button("OHLCV CSV 만들기", type="primary", use_container_width=True):
     except Exception as ex:
         st.error(f"수집 실패: {type(ex).__name__}: {ex}")
         st.stop()
+
+    if direct_diag is not None:
+        st.write(f"종목 해석: **{x['name']} ({x['code']})**")
+        st.write(
+            f"KRX issue code: **{direct_diag.get('isin','(없음)')}** "
+            f"({direct_diag.get('isin_status','')})"
+        )
+        if direct_diag.get("login_attempted"):
+            if direct_diag.get("login_success"):
+                st.success("KRX 로그인 성공")
+            else:
+                st.warning(
+                    f"KRX 로그인 실패: {direct_diag.get('login_code','')} "
+                    f"{direct_diag.get('login_message','')}"
+                )
+        else:
+            st.info("익명 KRX 세션으로 조회했습니다.")
+
+        ddf = pd.DataFrame(direct_diag.get("chunks", []))
+        if not ddf.empty:
+            with st.expander("KRX DIRECT 분할수집 로그", expanded=True):
+                st.dataframe(ddf, use_container_width=True, hide_index=True)
+                ok = int((ddf["status"] == "RAW_OK").sum())
+                empty = int((ddf["status"] == "RAW_EMPTY").sum())
+                er = int((~ddf["status"].isin(["RAW_OK", "RAW_EMPTY"])).sum())
+                st.write(f"RAW 성공 구간: **{ok}** / 빈 구간: **{empty}** / 기타 오류: **{er}**")
+
+        if direct_diag.get("isin_error") and direct_diag.get("isin_status") == "KNOWN_FALLBACK":
+            st.caption(f"finder 응답이 없어 검증된 ISIN fallback 사용: {direct_diag.get('isin_error')}")
 
     if fdr_diag is not None:
         st.write(f"종목 해석: **{x['name']} ({x['code']})**")
@@ -414,7 +669,17 @@ if st.button("OHLCV CSV 만들기", type="primary", use_container_width=True):
 
     if df.empty:
         st.error("선택한 소스에서 데이터가 없습니다. 위 진단 상태를 확인해 주세요.")
-        if source_mode.startswith("KRX"):
+        if source_mode.startswith("KRX DIRECT"):
+            if not krx_id:
+                st.info(
+                    "익명 KRX 조회가 빈 응답이면 위 'KRX 로그인'을 열어 "
+                    "본인의 KRX 계정으로 다시 시도하세요. ID/비밀번호는 채팅에 보내지 마세요."
+                )
+            else:
+                st.info(
+                    "로그인까지 성공했는데도 비면 KRX의 과거 데이터 제공 범위/권한 문제로 판단합니다."
+                )
+        elif source_mode.startswith("KRX pykrx"):
             st.info(
                 "중요: adjusted=True probe는 '데이터 존재 여부' 진단용일 뿐이며, "
                 "CSV에는 사용하지 않습니다."
