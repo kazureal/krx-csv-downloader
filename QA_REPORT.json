@@ -1,20 +1,15 @@
 {
-  "version": "1.0.11",
+  "version": "1.0.12",
   "date": "2026-08-27",
-  "evidence": {
-    "batch_previous": "10/10 NO_DATA",
-    "single_stock_060150_same_range": "4099 rows success"
-  },
-  "fix": {
-    "exact_single_stock_fetcher_reused": true,
-    "fresh_session_each_attempt": true,
-    "attempts_per_stock": 2,
-    "retry_wait_seconds": 8,
-    "inter_stock_wait_seconds": 8,
-    "default_batch_size": 2,
+  "checks": {
+    "compile_app": true,
+    "compile_engine": true,
+    "batch_wiring_static_verified": true,
+    "batch_path": "fetch_krx_direct_raw_isolated -> fetch_krx_direct_raw",
+    "csv_prefix_rule": "HHMMSS first",
+    "old_universe_zip_backward_compatible": true,
     "selection_order_changed": false,
     "future_outcomes_opened": false
   },
-  "compile": "PASS",
   "live_retest_required": true
 }

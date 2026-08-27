@@ -1,4 +1,4 @@
-# Korea OHLCV CSV v1.0.11 — STOCK + INDEX + UNIVERSE
+# Korea OHLCV CSV v1.0.12 — STOCK + INDEX + UNIVERSE
 
 ## 이번 업데이트
 기존 v0.9.9의 동작을 유지하면서 아래를 추가했습니다.
@@ -259,3 +259,24 @@ Changes:
 - This changes only operational acquisition behavior, not selection order or research sample rules
 - Liquidity remains PENDING until a verified trading-value source is available
 - H15/MFE/MAE remain sealed
+
+
+## v1.0.12 Batch wiring + CSV filename rule
+Batch wiring:
+- `make_batch_bundle()`의 실제 호출을
+  `fetch_krx_direct_raw_isolated() -> fetch_krx_direct_raw()`
+  로 수정.
+- exported batch audit에 실제 fetch path 기록.
+
+CSV filename rule:
+- 앞으로 생성되는 CSV 파일명은 **HHMMSS를 가장 앞에 둠**.
+- 예: `203015_인선이엔티_20100104_20260827_생성20260827.csv`
+- Batch 종목 CSV:
+  `203015_0001_인선이엔티_060150_20100104_20260827.csv`
+- Universe ZIP 내부 CSV도 동일하게 HHMMSS prefix 사용.
+- 기존 Universe ZIP의 옛 파일명도 parser가 계속 읽을 수 있음.
+
+주의:
+- 시간 prefix는 파일 관리/정렬 편의만을 위한 것이며
+  연구 selection, 표본수, 구조 규칙에는 영향 없음.
+- H15/MFE/MAE outcome은 계속 봉인.

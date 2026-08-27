@@ -6,15 +6,15 @@ import zipfile
 import hashlib
 import math
 import xml.etree.ElementTree as ET
-from datetime import date, timedelta
+from datetime import date, timedelta, datetime
 
 import pandas as pd
 import requests
 import streamlit as st
 
-from universe_engine_v0_1_11 import UniverseConfig, build_universe
+from universe_engine_v0_1_12 import UniverseConfig, build_universe
 
-st.set_page_config(page_title="Korea OHLCV CSV v1.0.11 STOCK + INDEX + UNIVERSE + BATCH", page_icon="📈")
+st.set_page_config(page_title="Korea OHLCV CSV v1.0.12 STOCK + INDEX + UNIVERSE + BATCH", page_icon="📈")
 
 H = {
     "User-Agent": "Mozilla/5.0",
@@ -477,13 +477,20 @@ def fetch_krx_direct_raw_isolated(code, start, end, login_id="", login_pw="", re
 def parse_universe_bundle(uploaded):
     raw = uploaded.getvalue()
     with zipfile.ZipFile(io.BytesIO(raw), "r") as zf:
-        names = set(zf.namelist())
-        required = {"development_selection_order.csv", "universe_audit.json"}
-        missing = required - names
-        if missing:
-            raise ValueError(f"Universe ZIP 필수파일 누락: {sorted(missing)}")
-        order = pd.read_csv(zf.open("development_selection_order.csv"), dtype={"ticker": str})
-        audit = json.load(zf.open("universe_audit.json"))
+        names = zf.namelist()
+
+        def pick_exact_or_suffix(exact_name):
+            if exact_name in names:
+                return exact_name
+            hits = [n for n in names if n.endswith("_" + exact_name)]
+            if not hits:
+                raise ValueError(f"Universe ZIP 필수파일 누락: {exact_name}")
+            return sorted(hits)[-1]
+
+        order_name = pick_exact_or_suffix("development_selection_order.csv")
+        audit_name = pick_exact_or_suffix("universe_audit.json")
+        order = pd.read_csv(zf.open(order_name), dtype={"ticker": str})
+        audit = json.load(zf.open(audit_name))
 
     order["ticker"] = order["ticker"].astype(str).str.zfill(6)
     if "development_selection_order" not in order.columns:
@@ -505,8 +512,14 @@ def make_batch_bundle(order_slice, start_date, end_date, login_id="", login_pw="
         if progress:
             progress((len(results)) / total, f"{pos}: {name} ({ticker}) 수집 중")
 
-        df, diag = fetch_krx_direct_raw_batch(
-            ticker, start_date, end_date, login_id=login_id, login_pw=login_pw
+        df, diag = fetch_krx_direct_raw_isolated(
+            ticker,
+            start_date,
+            end_date,
+            login_id=login_id,
+            login_pw=login_pw,
+            retries=2,
+            retry_wait=8.0,
         )
 
         rec = {
@@ -536,7 +549,7 @@ def make_batch_bundle(order_slice, start_date, end_date, login_id="", login_pw="
             rec["valid_sessions"] = int(export["valid_session"].sum())
             export["date"] = pd.to_datetime(export["date"]).dt.strftime("%Y-%m-%d")
             safe_name = safe_filename_piece(name)
-            fn = f"{pos:04d}_{safe_name}_{ticker}_{rec['actual_start'].replace('-','')}_{rec['actual_end'].replace('-','')}.csv"
+            fn = f"{filename_time_prefix()}_{pos:04d}_{safe_name}_{ticker}_{rec['actual_start'].replace('-','')}_{rec['actual_end'].replace('-','')}.csv"
             payload = export.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
             files[f"ohlcv/{fn}"] = payload
             rec["sha256"] = hashlib.sha256(payload).hexdigest()
@@ -557,16 +570,17 @@ def make_batch_bundle(order_slice, start_date, end_date, login_id="", login_pw="
 
     manifest_df = pd.DataFrame(results)
     manifest_bytes = manifest_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
-    files["batch_manifest.csv"] = manifest_bytes
+    files[f"{filename_time_prefix()}_batch_manifest.csv"] = manifest_bytes
 
     audit_obj = {
-        "app_build": "APP_v1.0.11",
-        "engine_build": "UNIVERSE_ENGINE_v0.1.11",
+        "app_build": "APP_v1.0.12",
+        "engine_build": "UNIVERSE_ENGINE_v0.1.12",
         "batch_start_order": int(order_slice["development_selection_order"].min()),
         "batch_end_order": int(order_slice["development_selection_order"].max()),
         "requested_start": str(start_date),
         "requested_end": str(end_date),
         "stock_count": int(len(order_slice)),
+        "batch_fetch_path": "fetch_krx_direct_raw_isolated->fetch_krx_direct_raw",
         "future_outcomes_opened": False,
         "stocks": audit_rows,
     }
@@ -1007,6 +1021,11 @@ def add_audit_columns(df):
 
 
 
+def filename_time_prefix():
+    """Filename sorting prefix requested by user: HHMMSS."""
+    return datetime.now().strftime("%H%M%S")
+
+
 def safe_filename_piece(x):
     x = str(x or "").strip()
     x = re.sub(r'[\\/:*?"<>|]+', "_", x)
@@ -1019,16 +1038,16 @@ def make_csv_filename(name, df, partial=False):
     start = pd.to_datetime(df["date"]).min().strftime("%Y%m%d")
     end = pd.to_datetime(df["date"]).max().strftime("%Y%m%d")
     suffix = "_PARTIAL" if partial else ""
-    return f"{safe_filename_piece(name)}_{start}_{end}_생성{created}{suffix}.csv"
+    return f"{filename_time_prefix()}_{safe_filename_piece(name)}_{start}_{end}_생성{created}{suffix}.csv"
 
 
-st.title("Korea OHLCV CSV v1.0.11 STOCK + INDEX + UNIVERSE + BATCH")
+st.title("Korea OHLCV CSV v1.0.12 STOCK + INDEX + UNIVERSE + BATCH")
 st.caption(
     "개별주식 KRX DIRECT RAW + KOSPI/KOSDAQ 지수(FDR) + "
     "Track 02 Development Universe · 원본 보존 · outcome-blind"
 )
 
-st.caption("BUILD: APP_v1.0.11 / UNIVERSE_ENGINE_v0.1.11 / BATCH_OHLCV_v0.3")
+st.caption("BUILD: APP_v1.0.12 / UNIVERSE_ENGINE_v0.1.12 / BATCH_OHLCV_v0.4")
 
 data_kind = st.radio(
     "수집 대상",
@@ -1130,17 +1149,21 @@ if data_kind == "Development Universe":
         order_bytes = ordered_out.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
         audit_bytes = json.dumps(diag, ensure_ascii=False, indent=2, default=str).encode("utf-8")
 
+        csv_prefix = filename_time_prefix()
+        universe_csv_name = f"{csv_prefix}_universe_snapshot.csv"
+        order_csv_name = f"{csv_prefix}_development_selection_order.csv"
+
         manifest = {
-            "universe_snapshot.csv": hashlib.sha256(full_bytes).hexdigest(),
-            "development_selection_order.csv": hashlib.sha256(order_bytes).hexdigest(),
+            universe_csv_name: hashlib.sha256(full_bytes).hexdigest(),
+            order_csv_name: hashlib.sha256(order_bytes).hexdigest(),
             "universe_audit.json": hashlib.sha256(audit_bytes).hexdigest(),
         }
         manifest_bytes = json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8")
 
         bio = io.BytesIO()
         with zipfile.ZipFile(bio, "w", zipfile.ZIP_DEFLATED) as zf:
-            zf.writestr("universe_snapshot.csv", full_bytes)
-            zf.writestr("development_selection_order.csv", order_bytes)
+            zf.writestr(universe_csv_name, full_bytes)
+            zf.writestr(order_csv_name, order_bytes)
             zf.writestr("universe_audit.json", audit_bytes)
             zf.writestr("SHA256_MANIFEST.json", manifest_bytes)
 
