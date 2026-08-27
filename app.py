@@ -7,7 +7,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-st.set_page_config(page_title="Korea OHLCV CSV v0.9.8 STOCK + INDEX", page_icon="📈")
+st.set_page_config(page_title="Korea OHLCV CSV v0.9.9 STOCK + INDEX", page_icon="📈")
 
 H = {
     "User-Agent": "Mozilla/5.0",
@@ -538,100 +538,97 @@ def _standardize_index(df, source, index_code, index_name):
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_krx_index(code, name, start, end):
     """
-    KRX index OHLCV.
-    v0.9.8:
-    - pykrx public get_index_ohlcv* 경로의 '지수명' KeyError를 우회한다.
-    - pykrx의 KRX core '개별지수시세' fetch를 직접 호출한다.
-    - code 1001 -> market='1', index='001'; code 2001 -> market='2', index='001'
-    - 긴 기간은 <=700 calendar-day 조각으로 수집한다.
-    - 원자료를 수정/보간하지 않는다.
+    Market index OHLCV.
+    v0.9.9:
+    - Streamlit server에서 불안정한 KRX/pykrx index 경로를 사용하지 않는다.
+    - FinanceDataReader 지수 심볼을 사용한다:
+        KOSPI  -> KS11
+        KOSDAQ -> KQ11
+    - 3년 단위로 분할 수집 후 날짜 기준 병합/중복 제거.
+    - source를 FDR_INDEX로 명시하여 KRX RAW와 혼동하지 않는다.
+    - 원자료 자동수정/보간 없음.
     """
     try:
-        import pykrx
-        from pykrx.website.krx.market.core import 개별지수시세
+        import FinanceDataReader as fdr
     except Exception as ex:
-        raise RuntimeError(
-            "pykrx KRX core를 불러오지 못했습니다. requirements.txt/pykrx 버전을 확인하세요."
-        ) from ex
+        raise RuntimeError("FinanceDataReader를 불러오지 못했습니다.") from ex
+
+    symbol_map = {
+        "1001": "KS11",
+        "2001": "KQ11",
+    }
+    symbol = symbol_map.get(str(code))
+    if symbol is None:
+        raise ValueError(f"지원하지 않는 시장지수 코드: {code}")
 
     diag = {
-        "pykrx_version": getattr(pykrx, "__version__", "unknown"),
-        "index_code": code,
+        "fdr_version": getattr(fdr, "__version__", "unknown"),
+        "index_code": str(code),
         "index_name": name,
+        "symbol": symbol,
         "requested_start": str(start),
         "requested_end": str(end),
         "chunks": [],
     }
 
-    if not (isinstance(code, str) and len(code) == 4 and code.isdigit()):
-        raise ValueError(f"지원하지 않는 지수코드 형식: {code}")
-
-    market_code = code[0]   # 1=KOSPI 계열, 2=KOSDAQ 계열
-    index_code = code[1:]   # 001
-
     pieces = []
     cur = start
     while cur <= end:
-        chunk_end = min(cur + timedelta(days=699), end)
+        # Long-range robustness: <= 3 calendar years per request.
+        chunk_end = min(date(cur.year + 2, 12, 31), end)
         rec = {
-            "start": str(cur), "end": str(chunk_end), "rows": 0,
-            "actual_start": "", "actual_end": "",
-            "method": "pykrx_core_개별지수시세",
-            "status": "", "error": "",
+            "start": str(cur),
+            "end": str(chunk_end),
+            "rows": 0,
+            "actual_start": "",
+            "actual_end": "",
+            "method": f"FinanceDataReader:{symbol}",
+            "status": "",
+            "error": "",
         }
-        try:
-            raw = 개별지수시세().fetch(
-                index_code,
-                market_code,
-                cur.strftime("%Y%m%d"),
-                chunk_end.strftime("%Y%m%d"),
-            )
 
+        try:
+            raw = fdr.DataReader(symbol, str(cur), str(chunk_end))
             if raw is None or raw.empty:
                 rec["status"] = "INDEX_EMPTY"
             else:
-                required = [
-                    "TRD_DD", "OPNPRC_IDX", "HGPRC_IDX", "LWPRC_IDX",
-                    "CLSPRC_IDX", "ACC_TRDVOL", "ACC_TRDVAL", "MKTCAP",
-                ]
-                missing = [c for c in required if c not in raw.columns]
+                x = raw.reset_index()
+                ren = {}
+                for c in x.columns:
+                    lc = str(c).strip().lower()
+                    if lc in ("date", "날짜", "index"):
+                        ren[c] = "date"
+                    elif lc in ("open", "시가"):
+                        ren[c] = "open"
+                    elif lc in ("high", "고가"):
+                        ren[c] = "high"
+                    elif lc in ("low", "저가"):
+                        ren[c] = "low"
+                    elif lc in ("close", "종가"):
+                        ren[c] = "close"
+                    elif lc in ("volume", "거래량"):
+                        ren[c] = "volume"
+                x = x.rename(columns=ren)
+
+                required = ["date", "open", "high", "low", "close", "volume"]
+                missing = [c for c in required if c not in x.columns]
                 if missing:
                     rec["status"] = "INDEX_SCHEMA_ERROR"
-                    rec["error"] = (
-                        f"missing={missing}; columns={raw.columns.tolist()[:30]}"
-                    )
+                    rec["error"] = f"missing={missing}; columns={x.columns.tolist()}"
                 else:
-                    x = raw[required].copy()
-                    x = x.rename(columns={
-                        "TRD_DD": "date",
-                        "OPNPRC_IDX": "open",
-                        "HGPRC_IDX": "high",
-                        "LWPRC_IDX": "low",
-                        "CLSPRC_IDX": "close",
-                        "ACC_TRDVOL": "volume",
-                        "ACC_TRDVAL": "trading_value",
-                        "MKTCAP": "market_cap",
-                    })
-
-                    # KRX 문자열 숫자(콤마/공백/'-') 정리
-                    x["date"] = pd.to_datetime(
-                        x["date"], format="%Y/%m/%d", errors="coerce"
-                    )
-                    for c in [
-                        "open", "high", "low", "close",
-                        "volume", "trading_value", "market_cap",
-                    ]:
-                        x[c] = x[c].map(_clean_krx_num)
-
+                    # FDR index output normally has no KRX trading_value/market_cap.
+                    x["trading_value"] = pd.NA
+                    x["market_cap"] = pd.NA
                     out = _standardize_index(
-                        x, "KRX_INDEX_DIRECT_CORE", code, name
+                        x, "FDR_INDEX", str(code), name
                     )
+
                     if out.empty:
                         rec["status"] = "INDEX_EMPTY_AFTER_STANDARDIZE"
                     else:
                         rec["rows"] = int(len(out))
-                        rec["actual_start"] = str(out.date.min().date())
-                        rec["actual_end"] = str(out.date.max().date())
+                        rec["actual_start"] = str(out["date"].min().date())
+                        rec["actual_end"] = str(out["date"].max().date())
                         rec["status"] = "INDEX_OK"
                         pieces.append(out)
 
@@ -647,7 +644,7 @@ def fetch_krx_index(code, name, start, end):
         diag["returned_rows"] = 0
         diag["status"] = "INDEX_EMPTY_ALL"
         return _standardize_index(
-            pd.DataFrame(), "KRX_INDEX_DIRECT_CORE", code, name
+            pd.DataFrame(), "FDR_INDEX", str(code), name
         ), diag
 
     out = pd.concat(pieces, ignore_index=True)
@@ -656,13 +653,11 @@ def fetch_krx_index(code, name, start, end):
         .drop_duplicates(subset=["date"], keep="last")
         .reset_index(drop=True)
     )
-    out = _standardize_index(
-        out, "KRX_INDEX_DIRECT_CORE", code, name
-    )
+    out = _standardize_index(out, "FDR_INDEX", str(code), name)
 
     diag["returned_rows"] = int(len(out))
-    diag["actual_start"] = str(out.date.min().date())
-    diag["actual_end"] = str(out.date.max().date())
+    diag["actual_start"] = str(out["date"].min().date())
+    diag["actual_end"] = str(out["date"].max().date())
     all_ok = all(r.get("status") == "INDEX_OK" for r in diag["chunks"])
     diag["status"] = "INDEX_OK" if all_ok else "INDEX_PARTIAL"
     return out, diag
@@ -734,7 +729,7 @@ def add_audit_columns(df):
     return out
 
 
-st.title("Korea OHLCV CSV v0.9.8 STOCK + INDEX")
+st.title("Korea OHLCV CSV v0.9.9 STOCK + INDEX")
 st.caption("개별주식 KRX DIRECT RAW + KOSPI/KOSDAQ 지수 일봉 · 장기기간 자동분할 · 원본 보존 · 자동보정 없음")
 
 data_kind = st.radio("수집 대상", ["개별주식", "시장지수"], horizontal=True)
@@ -777,7 +772,7 @@ else:
     source_mode = "KRX INDEX"
     krx_id = ""
     krx_pw = ""
-    st.info("시장지수는 KRX 지수 일봉의 direct-core 경로를 사용합니다. pykrx의 '지수명' 조회 오류를 우회하며, 개별주식 기능과 분리되어 있습니다.")
+    st.info("시장지수는 FinanceDataReader 지수 전용 경로를 사용합니다. 개별주식 KRX DIRECT RAW와 완전히 분리하며, CSV의 source에는 FDR_INDEX라고 명시합니다.")
 
 if st.button("OHLCV CSV 만들기", type="primary", use_container_width=True):
     if s > e:
@@ -900,7 +895,7 @@ if st.button("OHLCV CSV 만들기", type="primary", use_container_width=True):
     if df.empty:
         st.error("선택한 소스에서 데이터가 없습니다. 위 진단 상태를 확인해 주세요.")
         if data_kind == "시장지수":
-            st.info("KRX/pykrx 지수 경로가 비었습니다. 분할수집 로그의 method/error를 확인하세요.")
+            st.info("지수 데이터 경로가 비었습니다. 분할수집 로그의 method/error를 확인하세요.")
         elif source_mode.startswith("KRX DIRECT"):
             if not krx_id:
                 st.info(
