@@ -1,0 +1,14 @@
+{
+  "base": "krx_csv_downloader_v1.0.14_LOGIN_FORM_FIX_READY.zip",
+  "build": "APP_v1.0.14A_TRACK02_DATA_ADDENDUM",
+  "compile_pass": true,
+  "preserves_existing_endpoint": true,
+  "preserves_adjStkPrc_1": true,
+  "preserves_isolated_login_path": true,
+  "exports_ACC_TRDVAL": true,
+  "exports_MKTCAP": true,
+  "exports_LIST_SHRS": true,
+  "exports_FLUC_RT": true,
+  "valid_session_v11_positive_ohlc": true,
+  "future_outcomes_code_added": false
+}

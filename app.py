@@ -14,7 +14,7 @@ import streamlit as st
 
 from universe_engine_v0_1_14 import UniverseConfig, build_universe
 
-st.set_page_config(page_title="Korea OHLCV CSV v1.0.14 STOCK + INDEX + UNIVERSE + BATCH", page_icon="📈")
+st.set_page_config(page_title="Korea OHLCV CSV v1.0.14A TRACK02 DATA ADDENDUM", page_icon="📈")
 
 H = {
     "User-Agent": "Mozilla/5.0",
@@ -519,14 +519,29 @@ def fetch_krx_direct_raw_diagnostic(code, start, end, login_id="", login_pw=""):
                     "TDD_CLSPRC": "close",
                     "ACC_TRDVOL": "volume",
                 }
+                optional = {
+                    "ACC_TRDVAL": "trading_value",
+                    "MKTCAP": "market_cap",
+                    "LIST_SHRS": "listed_shares",
+                    "FLUC_TP_CD": "fluc_type_code",
+                    "CMPPREVDD_PRC": "change_price",
+                    "FLUC_RT": "change_rate_pct",
+                }
                 missing = [c for c in required if c not in x.columns]
                 rec["columns"] = x.columns.tolist()[:40]
                 rec["missing_required"] = missing
+                rec["optional_present"] = [c for c in optional if c in x.columns]
                 if not missing:
-                    y = x[list(required)].rename(columns=required)
+                    keep = list(required) + [c for c in optional if c in x.columns]
+                    rename_all = dict(required)
+                    rename_all.update({c: optional[c] for c in optional if c in x.columns})
+                    y = x[keep].rename(columns=rename_all)
                     y["date"] = pd.to_datetime(y["date"], format="%Y/%m/%d", errors="coerce")
-                    for c in ["open", "high", "low", "close", "volume"]:
-                        y[c] = y[c].map(_clean_krx_num)
+                    for c in ["open", "high", "low", "close", "volume",
+                              "trading_value", "market_cap", "listed_shares",
+                              "change_price", "change_rate_pct", "fluc_type_code"]:
+                        if c in y.columns:
+                            y[c] = y[c].map(_clean_krx_num)
                     pieces.append(y)
         except Exception as ex:
             rec["request_error"] = f"{type(ex).__name__}: {ex}"
@@ -545,9 +560,13 @@ def fetch_krx_direct_raw_diagnostic(code, start, end, login_id="", login_pw=""):
         .drop_duplicates("date", keep="last")
         .reset_index(drop=True)
     )
-    for c in ["open", "high", "low", "close", "volume"]:
-        out_df[c] = pd.to_numeric(out_df[c], errors="coerce").astype("Int64")
-    out_df["source"] = "KRX_DIRECT_RAW_DIAGNOSTIC"
+    for c in ["open", "high", "low", "close", "volume",
+              "trading_value", "market_cap", "listed_shares", "change_price", "fluc_type_code"]:
+        if c in out_df.columns:
+            out_df[c] = pd.to_numeric(out_df[c], errors="coerce").astype("Int64")
+    if "change_rate_pct" in out_df.columns:
+        out_df["change_rate_pct"] = pd.to_numeric(out_df["change_rate_pct"], errors="coerce").astype("Float64")
+    out_df["source"] = "KRX_DIRECT_RAW_DIAGNOSTIC_ADDENDUM"
     out_df["auto_corrected"] = False
     return out_df, diag
 
@@ -656,16 +675,31 @@ def make_batch_bundle(order_slice, start_date, end_date, login_id="", login_pw="
             "trading_value_nonnull": 0,
             "median_trading_value_20d": None,
             "liquidity_status": "",
+            "listed_shares_nonnull": 0,
+            "market_cap_nonnull": 0,
+            "change_rate_nonnull": 0,
             "future_outcomes_opened": False,
         }
 
         if not df.empty:
-            rec["liquidity_status"] = "PENDING_VERIFIED_TRADING_VALUE_SOURCE"
-
             export = df.copy()
             finite_ohlc = export[["open", "high", "low", "close"]].notna().all(axis=1)
-            export["valid_session"] = (export["volume"] != 0) & finite_ohlc
+            positive_ohlc = (export[["open", "high", "low", "close"]] > 0).all(axis=1)
+            export["valid_session"] = (export["volume"].fillna(0) > 0) & finite_ohlc & positive_ohlc
             rec["valid_sessions"] = int(export["valid_session"].sum())
+
+            if "trading_value" in export.columns:
+                tv_nonnull = export.loc[export["valid_session"], "trading_value"].notna()
+                rec["trading_value_nonnull"] = int(tv_nonnull.sum())
+                last20 = export.loc[export["valid_session"] & export["trading_value"].notna(), "trading_value"].tail(20)
+                rec["median_trading_value_20d"] = float(last20.median()) if len(last20) == 20 else None
+                rec["liquidity_status"] = "OFFICIAL_KRX_ACC_TRDVAL_PRESENT" if rec["trading_value_nonnull"] else "UNKNOWN_NO_TRADING_VALUE"
+            else:
+                rec["liquidity_status"] = "UNKNOWN_NO_TRADING_VALUE_COLUMN"
+
+            rec["listed_shares_nonnull"] = int(export["listed_shares"].notna().sum()) if "listed_shares" in export.columns else 0
+            rec["market_cap_nonnull"] = int(export["market_cap"].notna().sum()) if "market_cap" in export.columns else 0
+            rec["change_rate_nonnull"] = int(export["change_rate_pct"].notna().sum()) if "change_rate_pct" in export.columns else 0
             export["date"] = pd.to_datetime(export["date"]).dt.strftime("%Y-%m-%d")
             safe_name = safe_filename_piece(name)
             fn = f"{filename_time_prefix()}_{pos:04d}_{safe_name}_{ticker}_{rec['actual_start'].replace('-','')}_{rec['actual_end'].replace('-','')}.csv"
@@ -692,7 +726,7 @@ def make_batch_bundle(order_slice, start_date, end_date, login_id="", login_pw="
     files[f"{filename_time_prefix()}_batch_manifest.csv"] = manifest_bytes
 
     audit_obj = {
-        "app_build": "APP_v1.0.14",
+        "app_build": "APP_v1.0.14A_TRACK02_DATA_ADDENDUM",
         "engine_build": "UNIVERSE_ENGINE_v0.1.14",
         "batch_start_order": int(order_slice["development_selection_order"].min()),
         "batch_end_order": int(order_slice["development_selection_order"].max()),
@@ -1308,6 +1342,11 @@ if data_kind == "Development Universe":
 # DEVELOPMENT BATCH OHLCV
 # ---------------------------------------------------------------------
 elif data_kind == "Development Batch OHLCV":
+    st.success(
+        "Track02 Data Addendum build: 기존 OHLCV에 KRX 공식 거래대금(ACC_TRDVAL), "
+        "시가총액(MKTCAP), 상장주식수(LIST_SHRS), KRX 등락률을 추가 보존합니다. "
+        "미래 response outcome은 계산하지 않습니다."
+    )
     st.info(
         "승인된 Universe Audit Bundle ZIP을 입력으로 사용해 deterministic selection order를 그대로 따라갑니다. "
         "배치 크기는 서버 운영 단위일 뿐 연구 표본수 기준이 아닙니다. 첫 재시험은 2종목입니다."
