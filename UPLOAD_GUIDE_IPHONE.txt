@@ -1,0 +1,21 @@
+HRF SAFE UPDATE for Korea OHLCV CSV v1.0.14A
+
+중요:
+- 현재 GitHub의 app.py는 교체하지 마세요.
+- 이 업데이트는 기존 v1.0.14A를 보존한 채 HRF를 별도 Streamlit 페이지로 추가합니다.
+
+GitHub에 올릴 파일:
+1) hrf_living_map_v1.py                 -> 저장소 루트
+2) requirements.txt                     -> 기존 requirements.txt 교체
+3) pages/HRF_Living_Map.py              -> pages 폴더 안
+
+업데이트 후:
+- Streamlit이 재배포되면 사이드 메뉴에 HRF Living Map 페이지가 나타납니다.
+- 기존 앱에서 OHLCV CSV를 다운로드
+- HRF Living Map 페이지에서 그 CSV를 선택
+- Daily Gate / Authority / 상·하 S1 / NEXT / interaction / Structural Memory 확인
+
+안전 원칙:
+- CP71 FROZEN semantics 유지
+- ROOTED_DISCONTINUITY edge는 build 0.1 audit-only
+- 기존 v1.0.14A Development Universe 기능은 변경하지 않음
