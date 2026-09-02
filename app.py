@@ -6,8 +6,11 @@ import zipfile
 import hashlib
 import math
 import threading
+import os
+import tempfile
 import xml.etree.ElementTree as ET
 from datetime import date, timedelta, datetime
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -16,7 +19,7 @@ import streamlit as st
 
 from universe_engine_v0_1_14 import UniverseConfig, build_universe
 
-st.set_page_config(page_title="Korea OHLCV CSV v1.0.16 COMBINED FLOW", page_icon="📈")
+st.set_page_config(page_title="Korea OHLCV CSV v1.0.17 FLOW BATCH 99", page_icon="📈")
 
 H = {
     "User-Agent": "Mozilla/5.0",
@@ -54,7 +57,10 @@ KRX_LOGIN_JSP = "https://data.krx.co.kr/contents/MDC/COMS/client/view/login.jsp?
 KRX_LOGIN_URL = "https://data.krx.co.kr/contents/MDC/COMS/client/MDCCOMS001D1.cmd"
 KRX_REFERER = "https://data.krx.co.kr/contents/MDC/MDI/outerLoader/index.cmd"
 
-FLOW_ENGINE_VERSION = "INVESTOR_FLOW_INPUT_v0.2.0_20260902"
+FLOW_ENGINE_VERSION = "INVESTOR_FLOW_INPUT_v0.3.0_20260902"
+FLOW_BATCH_ENGINE_VERSION = "FLOW_BATCH_v0.1.0_20260902"
+FLOW_BATCH_TARGET_COUNT = 99
+FLOW_BATCH_CHECKPOINT_ROOT = Path(tempfile.gettempdir()) / "hrf_flow_batch_v1_0_17"
 FLOW_SOURCE = "KRX_VIA_PYKRX_INVESTOR_BY_DATE"
 FLOW_INVESTOR_ALIASES = {
     "institution": ("기관합계", "기관", "institution", "institution_total"),
@@ -742,7 +748,7 @@ def make_batch_bundle(order_slice, start_date, end_date, login_id="", login_pw="
     files[f"{filename_time_prefix()}_batch_manifest.csv"] = manifest_bytes
 
     audit_obj = {
-        "app_build": "APP_v1.0.14A_TRACK02_DATA_ADDENDUM",
+        "app_build": "APP_v1.0.17",
         "engine_build": "UNIVERSE_ENGINE_v0.1.14",
         "batch_start_order": int(order_slice["development_selection_order"].min()),
         "batch_end_order": int(order_slice["development_selection_order"].max()),
@@ -1320,123 +1326,91 @@ def add_flow_finalization_flag(flow, now_kst=None):
     return out
 
 
-def fetch_investor_flow_by_date(
-    ticker,
-    start,
-    end,
-    login_id="",
-    login_pw="",
-    max_days=365,
-    sleep_seconds=0.10,
-):
-    if not re.fullmatch(r"\d{6}", str(ticker)):
-        raise ValueError("ticker는 6자리 종목코드여야 합니다.")
-
-    diagnostics = {
+def _flow_diagnostics_template(ticker, start, end, pykrx_version="unknown"):
+    return {
         "flow_engine_version": FLOW_ENGINE_VERSION,
         "source": FLOW_SOURCE,
-        "pykrx_version": "unknown",
-        "ticker": ticker,
+        "pykrx_version": pykrx_version,
+        "ticker": str(ticker),
         "requested_start": str(start),
         "requested_end": str(end),
-        "auth_attempted": bool(login_id or login_pw),
+        "auth_attempted": False,
         "auth_success": False,
         "auth_error": "",
         "calls": [],
         "status": "",
     }
-    if not (login_id and login_pw):
-        diagnostics["status"] = "FLOW_AUTH_REQUIRED"
-        diagnostics["auth_error"] = "KRX_ID_AND_PASSWORD_REQUIRED"
-        return pd.DataFrame(), diagnostics
 
-    try:
-        import pykrx
-        from pykrx import stock
-        from pykrx.website.comm.auth import KRXSession, set_auth_session
-    except Exception as ex:
-        raise RuntimeError("pykrx를 불러오지 못했습니다. requirements.txt를 확인하세요.") from ex
 
-    diagnostics["pykrx_version"] = getattr(pykrx, "__version__", "unknown")
-    auth_session = None
-    FLOW_AUTH_LOCK.acquire()
-    try:
-        auth_session = KRXSession()
-        if not auth_session.refresh(login_id, login_pw):
-            diagnostics["status"] = "FLOW_AUTH_FAILED"
-            diagnostics["auth_error"] = "KRX_LOGIN_REJECTED"
-            return pd.DataFrame(), diagnostics
-        set_auth_session(auth_session)
-        diagnostics["auth_success"] = True
+def fetch_investor_flow_from_active_session(
+    stock_api,
+    ticker,
+    start,
+    end,
+    pykrx_version="unknown",
+    max_days=365,
+    sleep_seconds=0.10,
+):
+    """Fetch one stock while an authenticated pykrx session is already active."""
+    if not re.fullmatch(r"\d{6}", str(ticker)):
+        raise ValueError("ticker는 6자리 종목코드여야 합니다.")
 
-        chunk_frames = []
-        for chunk_start, chunk_end in _flow_chunk_ranges(start, end, max_days=max_days):
-            raw_frames = {}
-            for metric in FLOW_METRICS:
-                function = (
-                    stock.get_market_trading_volume_by_date
-                    if metric == "qty"
-                    else stock.get_market_trading_value_by_date
-                )
-                for side, krx_side in FLOW_SIDES.items():
-                    record = {
-                        "start": str(chunk_start),
-                        "end": str(chunk_end),
-                        "metric": metric,
-                        "side": side,
-                        "rows": 0,
-                        "status": "",
-                        "error": "",
-                    }
-                    try:
-                        args = (
-                            chunk_start.strftime("%Y%m%d"),
-                            chunk_end.strftime("%Y%m%d"),
-                            ticker,
-                        )
-                        frame = function(*args) if krx_side is None else function(*args, on=krx_side)
-                        if frame is None or frame.empty:
-                            record["status"] = "EMPTY"
-                            raw_frames[(metric, side)] = pd.DataFrame()
-                        else:
-                            record["rows"] = int(len(frame))
-                            probe = normalize_investor_frame(frame, metric, side)
-                            required = {
-                                f"institution_{side}_{metric}",
-                                f"foreign_{side}_{metric}",
-                            }
-                            if required.issubset(probe.columns):
-                                record["status"] = "OK"
-                            else:
-                                record["status"] = "SCHEMA_ERROR"
-                                record["error"] = f"columns={list(map(str, frame.columns))}"
-                            raw_frames[(metric, side)] = frame
-                    except Exception as ex:
-                        record["status"] = "ERROR"
-                        record["error"] = f"{type(ex).__name__}: {ex}"
+    diagnostics = _flow_diagnostics_template(ticker, start, end, pykrx_version)
+    diagnostics["auth_attempted"] = True
+    diagnostics["auth_success"] = True
+    chunk_frames = []
+    for chunk_start, chunk_end in _flow_chunk_ranges(start, end, max_days=max_days):
+        raw_frames = {}
+        for metric in FLOW_METRICS:
+            function = (
+                stock_api.get_market_trading_volume_by_date
+                if metric == "qty"
+                else stock_api.get_market_trading_value_by_date
+            )
+            for side, krx_side in FLOW_SIDES.items():
+                record = {
+                    "start": str(chunk_start),
+                    "end": str(chunk_end),
+                    "metric": metric,
+                    "side": side,
+                    "rows": 0,
+                    "status": "",
+                    "error": "",
+                }
+                try:
+                    args = (
+                        chunk_start.strftime("%Y%m%d"),
+                        chunk_end.strftime("%Y%m%d"),
+                        str(ticker),
+                    )
+                    frame = function(*args) if krx_side is None else function(*args, on=krx_side)
+                    if frame is None or frame.empty:
+                        record["status"] = "EMPTY"
                         raw_frames[(metric, side)] = pd.DataFrame()
-                    diagnostics["calls"].append(record)
-                    if sleep_seconds > 0:
-                        time.sleep(sleep_seconds)
+                    else:
+                        record["rows"] = int(len(frame))
+                        probe = normalize_investor_frame(frame, metric, side)
+                        required = {
+                            f"institution_{side}_{metric}",
+                            f"foreign_{side}_{metric}",
+                        }
+                        if required.issubset(probe.columns):
+                            record["status"] = "OK"
+                        else:
+                            record["status"] = "SCHEMA_ERROR"
+                            record["error"] = f"columns={list(map(str, frame.columns))}"
+                        raw_frames[(metric, side)] = frame
+                except Exception as ex:
+                    record["status"] = "ERROR"
+                    record["error"] = f"{type(ex).__name__}: {ex}"
+                    raw_frames[(metric, side)] = pd.DataFrame()
+                diagnostics["calls"].append(record)
+                if sleep_seconds > 0:
+                    time.sleep(sleep_seconds)
 
-            chunk = assemble_flow_frames(raw_frames)
-            if not chunk.empty:
-                chunk_frames.append(chunk)
-    except Exception as ex:
-        diagnostics["status"] = "FLOW_AUTH_OR_SESSION_ERROR"
-        diagnostics["auth_error"] = f"{type(ex).__name__}: {ex}"
-        return pd.DataFrame(), diagnostics
-    finally:
-        try:
-            set_auth_session(None)
-        except Exception:
-            pass
-        try:
-            if auth_session is not None:
-                auth_session.session.close()
-        except Exception:
-            pass
-        FLOW_AUTH_LOCK.release()
+        chunk = assemble_flow_frames(raw_frames)
+        if not chunk.empty:
+            chunk_frames.append(chunk)
 
     if not chunk_frames:
         diagnostics["status"] = "FLOW_EMPTY"
@@ -1460,6 +1434,69 @@ def fetch_investor_flow_by_date(
     diagnostics["identity_failure_rows"] = int((~out["flow_identity_ok"]).sum())
     diagnostics["provisional_rows"] = int((~out["flow_finalized"]).sum())
     return out, diagnostics
+
+
+def fetch_investor_flow_by_date(
+    ticker,
+    start,
+    end,
+    login_id="",
+    login_pw="",
+    max_days=365,
+    sleep_seconds=0.10,
+):
+    if not re.fullmatch(r"\d{6}", str(ticker)):
+        raise ValueError("ticker는 6자리 종목코드여야 합니다.")
+
+    diagnostics = _flow_diagnostics_template(ticker, start, end)
+    diagnostics["auth_attempted"] = bool(login_id or login_pw)
+    if not (login_id and login_pw):
+        diagnostics["status"] = "FLOW_AUTH_REQUIRED"
+        diagnostics["auth_error"] = "KRX_ID_AND_PASSWORD_REQUIRED"
+        return pd.DataFrame(), diagnostics
+
+    try:
+        import pykrx
+        from pykrx import stock
+        from pykrx.website.comm.auth import KRXSession, set_auth_session
+    except Exception as ex:
+        raise RuntimeError("pykrx를 불러오지 못했습니다. requirements.txt를 확인하세요.") from ex
+
+    pykrx_version = getattr(pykrx, "__version__", "unknown")
+    diagnostics["pykrx_version"] = pykrx_version
+    auth_session = None
+    FLOW_AUTH_LOCK.acquire()
+    try:
+        auth_session = KRXSession()
+        if not auth_session.refresh(login_id, login_pw):
+            diagnostics["status"] = "FLOW_AUTH_FAILED"
+            diagnostics["auth_error"] = "KRX_LOGIN_REJECTED"
+            return pd.DataFrame(), diagnostics
+        set_auth_session(auth_session)
+        return fetch_investor_flow_from_active_session(
+            stock,
+            ticker,
+            start,
+            end,
+            pykrx_version=pykrx_version,
+            max_days=max_days,
+            sleep_seconds=sleep_seconds,
+        )
+    except Exception as ex:
+        diagnostics["status"] = "FLOW_AUTH_OR_SESSION_ERROR"
+        diagnostics["auth_error"] = f"{type(ex).__name__}: {ex}"
+        return pd.DataFrame(), diagnostics
+    finally:
+        try:
+            set_auth_session(None)
+        except Exception:
+            pass
+        try:
+            if auth_session is not None:
+                auth_session.session.close()
+        except Exception:
+            pass
+        FLOW_AUTH_LOCK.release()
 
 
 def _flow_weighted_std(values, weights, mean):
@@ -1562,25 +1599,526 @@ def merge_ohlcv_and_flow_exact(ohlcv, flow):
     return merged.sort_values("date").reset_index(drop=True), diagnostics
 
 
+def latest_finalized_flow_date(now_kst=None):
+    now = now_kst or datetime.now(ZoneInfo("Asia/Seoul"))
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=ZoneInfo("Asia/Seoul"))
+    else:
+        now = now.astimezone(ZoneInfo("Asia/Seoul"))
+    return now.date() if now.hour >= 18 else now.date() - timedelta(days=1)
+
+
+def audit_combined_flow_frame(merged):
+    """Independent conservation audit; off-session price observations are flagged, not rejected."""
+    investors = list(FLOW_ALL_INVESTORS)
+    required = ["date", "low", "high", "volume"]
+    required += [
+        f"{investor}_{side}_{metric}"
+        for investor in investors
+        for side in FLOW_SIDES
+        for metric in FLOW_METRICS
+    ]
+    missing = [column for column in required if column not in merged.columns]
+    out = {
+        "rows": int(len(merged)),
+        "missing_required_columns": missing,
+        "duplicate_dates": int(merged["date"].duplicated().sum()) if "date" in merged else 0,
+        "participant_qty_identity_failures": 0,
+        "participant_value_identity_failures": 0,
+        "buy_qty_vs_volume_failures": 0,
+        "sell_qty_vs_volume_failures": 0,
+        "net_qty_conservation_failures": 0,
+        "buy_value_vs_sell_value_failures": 0,
+        "net_value_conservation_failures": 0,
+        "institution_buy_avg_outside_regular_ohlc": 0,
+        "foreign_buy_avg_outside_regular_ohlc": 0,
+        "status": "",
+    }
+    if missing:
+        out["status"] = "CONSERVATION_MISSING_COLUMNS"
+        return out
+
+    x = merged.copy()
+    for metric in FLOW_METRICS:
+        for investor in investors:
+            buy = pd.to_numeric(x[f"{investor}_buy_{metric}"], errors="coerce")
+            sell = pd.to_numeric(x[f"{investor}_sell_{metric}"], errors="coerce")
+            net = pd.to_numeric(x[f"{investor}_net_{metric}"], errors="coerce")
+            failures = (buy.isna() | sell.isna() | net.isna() | ((buy - sell) != net))
+            key = f"participant_{metric}_identity_failures"
+            out[key] += int(failures.sum())
+
+    buy_qty = sum(pd.to_numeric(x[f"{i}_buy_qty"], errors="coerce") for i in investors)
+    sell_qty = sum(pd.to_numeric(x[f"{i}_sell_qty"], errors="coerce") for i in investors)
+    net_qty = sum(pd.to_numeric(x[f"{i}_net_qty"], errors="coerce") for i in investors)
+    buy_value = sum(pd.to_numeric(x[f"{i}_buy_value"], errors="coerce") for i in investors)
+    sell_value = sum(pd.to_numeric(x[f"{i}_sell_value"], errors="coerce") for i in investors)
+    net_value = sum(pd.to_numeric(x[f"{i}_net_value"], errors="coerce") for i in investors)
+    volume = pd.to_numeric(x["volume"], errors="coerce")
+
+    out["buy_qty_vs_volume_failures"] = int((buy_qty.isna() | volume.isna() | (buy_qty != volume)).sum())
+    out["sell_qty_vs_volume_failures"] = int((sell_qty.isna() | volume.isna() | (sell_qty != volume)).sum())
+    out["net_qty_conservation_failures"] = int((net_qty.isna() | (net_qty != 0)).sum())
+    out["buy_value_vs_sell_value_failures"] = int(
+        (buy_value.isna() | sell_value.isna() | (buy_value != sell_value)).sum()
+    )
+    out["net_value_conservation_failures"] = int((net_value.isna() | (net_value != 0)).sum())
+
+    low = pd.to_numeric(x["low"], errors="coerce")
+    high = pd.to_numeric(x["high"], errors="coerce")
+    for investor in FLOW_CORE_INVESTORS:
+        avg = pd.to_numeric(x[f"{investor}_gross_buy_avg_price"], errors="coerce")
+        out[f"{investor}_buy_avg_outside_regular_ohlc"] = int(
+            (avg.notna() & ((avg < low) | (avg > high))).sum()
+        )
+
+    blocking = [
+        "duplicate_dates",
+        "participant_qty_identity_failures",
+        "participant_value_identity_failures",
+        "buy_qty_vs_volume_failures",
+        "sell_qty_vs_volume_failures",
+        "net_qty_conservation_failures",
+        "buy_value_vs_sell_value_failures",
+        "net_value_conservation_failures",
+    ]
+    out["status"] = "CONSERVATION_OK" if all(out[key] == 0 for key in blocking) else "CONSERVATION_FAILED"
+    return out
+
+
+def _flow_batch_sorted_order(order_slice):
+    required = ["development_selection_order", "ticker"]
+    missing = [column for column in required if column not in order_slice.columns]
+    if missing:
+        raise ValueError(f"Development order 필수 열 누락: {missing}")
+    out = order_slice.copy()
+    out["ticker"] = out["ticker"].astype(str).str.zfill(6)
+    out = out.sort_values("development_selection_order").drop_duplicates("ticker", keep="first")
+    if out.empty:
+        raise ValueError("수집할 Development 종목이 없습니다.")
+    return out.reset_index(drop=True)
+
+
+def flow_batch_job_id(order_slice, start_date, end_date):
+    ordered = _flow_batch_sorted_order(order_slice)
+    identity = {
+        "flow_batch_engine": FLOW_BATCH_ENGINE_VERSION,
+        "flow_engine": FLOW_ENGINE_VERSION,
+        "start": str(start_date),
+        "end": str(end_date),
+        "stocks": [
+            [int(row["development_selection_order"]), str(row["ticker"]).zfill(6)]
+            for _, row in ordered.iterrows()
+        ],
+    }
+    raw = json.dumps(identity, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()[:20]
+
+
+def _atomic_write_bytes(path, payload):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_bytes(payload)
+    os.replace(temporary, path)
+
+
+def _atomic_write_json(path, value):
+    payload = json.dumps(value, ensure_ascii=False, indent=2, default=str).encode("utf-8")
+    _atomic_write_bytes(path, payload)
+
+
+def _flow_batch_checkpoint_paths(job_dir, order_number, ticker):
+    stem = f"ORD{int(order_number):04d}_{str(ticker).zfill(6)}"
+    return Path(job_dir) / f"{stem}.csv", Path(job_dir) / f"{stem}.json"
+
+
+def load_flow_batch_checkpoint(job_dir, job_id, order_number, ticker, start_date, end_date):
+    csv_path, meta_path = _flow_batch_checkpoint_paths(job_dir, order_number, ticker)
+    if not csv_path.is_file() or not meta_path.is_file():
+        return None
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        payload = csv_path.read_bytes()
+    except Exception:
+        return None
+    expected = {
+        "job_id": str(job_id),
+        "flow_batch_engine": FLOW_BATCH_ENGINE_VERSION,
+        "flow_engine": FLOW_ENGINE_VERSION,
+        "development_selection_order": int(order_number),
+        "ticker": str(ticker).zfill(6),
+        "requested_start": str(start_date),
+        "requested_end": str(end_date),
+        "status": "OK",
+    }
+    if any(meta.get(key) != value for key, value in expected.items()):
+        return None
+    if hashlib.sha256(payload).hexdigest() != meta.get("sha256"):
+        return None
+    return payload, meta
+
+
+def save_flow_batch_checkpoint(job_dir, metadata, payload):
+    csv_path, meta_path = _flow_batch_checkpoint_paths(
+        job_dir,
+        metadata["development_selection_order"],
+        metadata["ticker"],
+    )
+    meta = dict(metadata)
+    meta["sha256"] = hashlib.sha256(payload).hexdigest()
+    _atomic_write_bytes(csv_path, payload)
+    _atomic_write_json(meta_path, meta)
+    return meta
+
+
+def fetch_ohlcv_for_flow_batch(ticker, start_date, end_date, retries=2, retry_wait=8.0, fetcher=None):
+    fetch = fetcher or fetch_krx_direct_raw
+    attempts = []
+    last = pd.DataFrame()
+    for attempt in range(1, int(retries) + 1):
+        t0 = time.time()
+        try:
+            frame, diagnostics = fetch(ticker, start_date, end_date)
+            error = ""
+        except Exception as ex:
+            frame, diagnostics = pd.DataFrame(), {}
+            error = f"{type(ex).__name__}: {ex}"
+        attempts.append({
+            "attempt": attempt,
+            "rows": int(len(frame)),
+            "elapsed_seconds": round(time.time() - t0, 3),
+            "error": error,
+            "diagnostics": diagnostics,
+        })
+        last = frame
+        if not frame.empty:
+            return frame, {"status": "OHLCV_OK", "attempts": attempts}
+        if attempt < int(retries) and retry_wait > 0:
+            time.sleep(float(retry_wait))
+    return last, {"status": "OHLCV_EMPTY", "attempts": attempts}
+
+
+def build_development_flow_batch_with_active_session(
+    order_slice,
+    start_date,
+    end_date,
+    stock_api,
+    pykrx_version="unknown",
+    progress=None,
+    checkpoint_root=None,
+    ohlcv_fetcher=None,
+    flow_max_days=365,
+    flow_sleep_seconds=0.25,
+    stock_cooldown_seconds=2.0,
+    reauthenticate=None,
+):
+    ordered = _flow_batch_sorted_order(order_slice)
+    job_id = flow_batch_job_id(ordered, start_date, end_date)
+    root = Path(checkpoint_root or FLOW_BATCH_CHECKPOINT_ROOT)
+    job_dir = root / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+
+    manifest_rows = []
+    stock_audits = []
+    total = len(ordered)
+    for batch_index, row in ordered.iterrows():
+        started = time.time()
+        position = int(row["development_selection_order"])
+        ticker = str(row["ticker"]).zfill(6)
+        name = str(row.get("name", ticker))
+        if progress:
+            progress(batch_index / max(total, 1), f"{batch_index + 1}/{total} · {position}: {name} ({ticker})")
+
+        checkpoint = load_flow_batch_checkpoint(
+            job_dir, job_id, position, ticker, start_date, end_date
+        )
+        if checkpoint is not None:
+            _, metadata = checkpoint
+            rec = dict(metadata["manifest_record"])
+            rec["checkpoint_reused"] = True
+            rec["elapsed_seconds"] = round(time.time() - started, 3)
+            manifest_rows.append(rec)
+            stock_audits.append({
+                "development_selection_order": position,
+                "ticker": ticker,
+                "name": name,
+                "checkpoint_reused": True,
+                "quality_audit": metadata.get("quality_audit", {}),
+            })
+            continue
+
+        rec = {
+            "development_selection_order": position,
+            "ticker": ticker,
+            "name": name,
+            "market": row.get("market", ""),
+            "selection_sector": row.get("selection_sector", ""),
+            "selection_stratum": row.get("selection_stratum", ""),
+            "status": "",
+            "rows": 0,
+            "actual_start": "",
+            "actual_end": "",
+            "valid_sessions": 0,
+            "ohlc_warning_rows": 0,
+            "flow_status": "",
+            "merge_status": "",
+            "conservation_status": "",
+            "checkpoint_reused": False,
+            "elapsed_seconds": 0.0,
+            "sha256": "",
+            "file": "",
+            "error": "",
+        }
+        stock_audit = {
+            "development_selection_order": position,
+            "ticker": ticker,
+            "name": name,
+            "checkpoint_reused": False,
+            "ohlcv": {},
+            "flow_attempts": [],
+            "merge": {},
+            "quality_audit": {},
+        }
+
+        try:
+            ohlcv, ohlcv_diagnostics = fetch_ohlcv_for_flow_batch(
+                ticker,
+                start_date,
+                end_date,
+                retries=2,
+                retry_wait=8.0 if ohlcv_fetcher is None else 0.0,
+                fetcher=ohlcv_fetcher,
+            )
+            stock_audit["ohlcv"] = ohlcv_diagnostics
+            if ohlcv.empty:
+                rec["status"] = "OHLCV_EMPTY"
+            else:
+                ohlcv = add_audit_columns(ohlcv)
+                rec["valid_sessions"] = int(ohlcv["valid_session"].sum())
+                rec["ohlc_warning_rows"] = int((ohlcv["ohlc_warning"] != "").sum())
+
+                flow = pd.DataFrame()
+                flow_diagnostics = {}
+                for flow_attempt in range(1, 3):
+                    flow, flow_diagnostics = fetch_investor_flow_from_active_session(
+                        stock_api,
+                        ticker,
+                        start_date,
+                        end_date,
+                        pykrx_version=pykrx_version,
+                        max_days=flow_max_days,
+                        sleep_seconds=flow_sleep_seconds,
+                    )
+                    stock_audit["flow_attempts"].append({
+                        "attempt": flow_attempt,
+                        "diagnostics": flow_diagnostics,
+                    })
+                    if flow_diagnostics.get("status") == "FLOW_OK":
+                        break
+                    if flow_attempt == 1 and callable(reauthenticate):
+                        stock_audit["reauthentication_attempted"] = True
+                        stock_audit["reauthentication_success"] = bool(reauthenticate())
+                    if flow_attempt == 1:
+                        time.sleep(3.0 if flow_sleep_seconds > 0 else 0.0)
+
+                rec["flow_status"] = flow_diagnostics.get("status", "")
+                if flow.empty or rec["flow_status"] != "FLOW_OK":
+                    rec["status"] = rec["flow_status"] or "FLOW_EMPTY"
+                elif not bool(flow["flow_finalized"].all()):
+                    rec["status"] = "FLOW_NOT_FINALIZED"
+                else:
+                    merged, merge_diagnostics = merge_ohlcv_and_flow_exact(ohlcv, flow)
+                    stock_audit["merge"] = merge_diagnostics
+                    rec["merge_status"] = merge_diagnostics.get("status", "")
+                    if merged.empty or rec["merge_status"] != "MERGE_OK":
+                        rec["status"] = rec["merge_status"] or "MERGE_FAILED"
+                    else:
+                        quality = audit_combined_flow_frame(merged)
+                        stock_audit["quality_audit"] = quality
+                        rec["conservation_status"] = quality.get("status", "")
+                        if rec["conservation_status"] != "CONSERVATION_OK":
+                            rec["status"] = rec["conservation_status"] or "CONSERVATION_FAILED"
+                        else:
+                            export = merged.copy()
+                            export["date"] = pd.to_datetime(export["date"]).dt.strftime("%Y-%m-%d")
+                            payload = export.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+                            rec["status"] = "OK"
+                            rec["rows"] = int(len(export))
+                            rec["actual_start"] = str(export["date"].min())
+                            rec["actual_end"] = str(export["date"].max())
+                            rec["file"] = (
+                                f"combined/ORD{position:04d}_{safe_filename_piece(name)}_{ticker}_"
+                                f"{rec['actual_start'].replace('-', '')}_{rec['actual_end'].replace('-', '')}_"
+                                "OHLCV_INVESTOR_FLOW.csv"
+                            )
+                            rec["sha256"] = hashlib.sha256(payload).hexdigest()
+                            metadata = {
+                                "job_id": job_id,
+                                "flow_batch_engine": FLOW_BATCH_ENGINE_VERSION,
+                                "flow_engine": FLOW_ENGINE_VERSION,
+                                "development_selection_order": position,
+                                "ticker": ticker,
+                                "requested_start": str(start_date),
+                                "requested_end": str(end_date),
+                                "status": "OK",
+                                "manifest_record": rec,
+                                "quality_audit": quality,
+                            }
+                            save_flow_batch_checkpoint(job_dir, metadata, payload)
+        except Exception as ex:
+            rec["status"] = "EXCEPTION"
+            rec["error"] = f"{type(ex).__name__}: {ex}"
+
+        rec["elapsed_seconds"] = round(time.time() - started, 3)
+        manifest_rows.append(rec)
+        stock_audits.append(stock_audit)
+        if stock_cooldown_seconds > 0:
+            time.sleep(float(stock_cooldown_seconds))
+
+    manifest_df = pd.DataFrame(manifest_rows).sort_values("development_selection_order").reset_index(drop=True)
+    files = {}
+    for _, rec in manifest_df.loc[manifest_df["status"] == "OK"].iterrows():
+        checkpoint = load_flow_batch_checkpoint(
+            job_dir,
+            job_id,
+            int(rec["development_selection_order"]),
+            str(rec["ticker"]).zfill(6),
+            start_date,
+            end_date,
+        )
+        if checkpoint is None:
+            continue
+        payload, metadata = checkpoint
+        files[str(metadata["manifest_record"]["file"])] = payload
+
+    manifest_bytes = manifest_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+    files["batch_manifest.csv"] = manifest_bytes
+    audit_obj = {
+        "app_build": "APP_v1.0.17",
+        "flow_batch_engine": FLOW_BATCH_ENGINE_VERSION,
+        "flow_engine": FLOW_ENGINE_VERSION,
+        "job_id": job_id,
+        "requested_start": str(start_date),
+        "requested_end": str(end_date),
+        "requested_stock_count": int(total),
+        "successful_stock_count": int((manifest_df["status"] == "OK").sum()),
+        "checkpoint_reused_count": int(manifest_df["checkpoint_reused"].sum()),
+        "credentials_stored": False,
+        "same_runtime_resume_supported": True,
+        "zero_fill_used": False,
+        "hrf_core_modified": False,
+        "future_outcomes_opened": False,
+        "stocks": stock_audits,
+    }
+    audit_bytes = json.dumps(audit_obj, ensure_ascii=False, indent=2, default=str).encode("utf-8")
+    files["batch_audit.json"] = audit_bytes
+    sha_manifest = {name: hashlib.sha256(payload).hexdigest() for name, payload in files.items()}
+    files["SHA256_MANIFEST.json"] = json.dumps(
+        sha_manifest, ensure_ascii=False, indent=2
+    ).encode("utf-8")
+
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as zf:
+        for name, payload in files.items():
+            zf.writestr(name, payload)
+    if progress:
+        progress(1.0, f"완료 {int((manifest_df['status'] == 'OK').sum())}/{total}")
+    return output.getvalue(), manifest_df, audit_obj
+
+
+def make_development_flow_batch_bundle(
+    order_slice,
+    start_date,
+    end_date,
+    login_id,
+    login_pw,
+    progress=None,
+    checkpoint_root=None,
+    ohlcv_fetcher=None,
+    flow_max_days=365,
+    flow_sleep_seconds=0.25,
+    stock_cooldown_seconds=2.0,
+):
+    if not (login_id and login_pw):
+        raise ValueError("KRX_ID_AND_PASSWORD_REQUIRED")
+    try:
+        import pykrx
+        from pykrx import stock
+        from pykrx.website.comm.auth import KRXSession, set_auth_session
+    except Exception as ex:
+        raise RuntimeError("pykrx를 불러오지 못했습니다. requirements.txt를 확인하세요.") from ex
+
+    pykrx_version = getattr(pykrx, "__version__", "unknown")
+    auth_session = None
+    FLOW_AUTH_LOCK.acquire()
+    try:
+        auth_session = KRXSession()
+        if not auth_session.refresh(login_id, login_pw):
+            raise PermissionError("KRX_LOGIN_REJECTED")
+        set_auth_session(auth_session)
+
+        def reauthenticate():
+            try:
+                ok = bool(auth_session.refresh(login_id, login_pw))
+                if ok:
+                    set_auth_session(auth_session)
+                return ok
+            except Exception:
+                return False
+
+        return build_development_flow_batch_with_active_session(
+            order_slice,
+            start_date,
+            end_date,
+            stock,
+            pykrx_version=pykrx_version,
+            progress=progress,
+            checkpoint_root=checkpoint_root,
+            ohlcv_fetcher=ohlcv_fetcher,
+            flow_max_days=flow_max_days,
+            flow_sleep_seconds=flow_sleep_seconds,
+            stock_cooldown_seconds=stock_cooldown_seconds,
+            reauthenticate=reauthenticate,
+        )
+    finally:
+        try:
+            set_auth_session(None)
+        except Exception:
+            pass
+        try:
+            if auth_session is not None:
+                auth_session.session.close()
+        except Exception:
+            pass
+        FLOW_AUTH_LOCK.release()
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_flow_cached(ticker, start, end):
     return fetch_investor_flow_by_date(ticker, start, end)
 
 
-st.title("Korea OHLCV CSV v1.0.16 STOCK + FLOW + INDEX + UNIVERSE + BATCH")
+st.title("Korea OHLCV CSV v1.0.17 STOCK + FLOW BATCH 99 + INDEX + UNIVERSE")
 st.caption(
     "개별주식 KRX DIRECT RAW + KOSPI/KOSDAQ 지수(FDR) + "
     "Track 02 Development Universe · 원본 보존 · outcome-blind"
 )
 
 st.caption(
-    "BUILD: APP_v1.0.16 / UNIVERSE_ENGINE_v0.1.14 / "
-    "BATCH_OHLCV_v0.6 / INVESTOR_FLOW_INPUT_v0.2.0"
+    "BUILD: APP_v1.0.17 / UNIVERSE_ENGINE_v0.1.14 / "
+    "BATCH_OHLCV_v0.6 / INVESTOR_FLOW_INPUT_v0.3.0 / FLOW_BATCH_v0.1.0"
 )
 
 data_kind = st.radio(
     "수집 대상",
-    ["개별주식", "시장지수", "Development Universe", "Development Batch OHLCV"],
+    [
+        "개별주식",
+        "시장지수",
+        "Development Universe",
+        "Development Batch OHLCV",
+        "Development Batch OHLCV + FLOW (99)",
+    ],
     horizontal=True,
 )
 
@@ -2063,6 +2601,193 @@ elif data_kind == "Development Batch OHLCV":
                     "ZIP 안에는 종목별 OHLCV CSV, batch_manifest.csv, batch_audit.json, "
                     "SHA256_MANIFEST.json이 들어 있습니다. H15/MFE/MAE는 생성하지 않습니다."
                 )
+
+# ---------------------------------------------------------------------
+# DEVELOPMENT BATCH OHLCV + INVESTOR FLOW — one-click, sequential, resumable
+# ---------------------------------------------------------------------
+elif data_kind == "Development Batch OHLCV + FLOW (99)":
+    st.success(
+        "승인된 Development selection order의 앞 99종목을 한 번 실행으로 순차 수집합니다. "
+        "각 종목은 OHLCV·기관/외국인 수급·날짜 일치·보존식을 통과해야 완료로 저장됩니다."
+    )
+    st.warning(
+        "99종목은 KRX 요청량이 많아 수 시간이 걸릴 수 있습니다. 병렬 폭주는 사용하지 않습니다. "
+        "연결이 끊기면 같은 Universe ZIP·날짜·종목수로 다시 실행하세요. 같은 실행 서버에 남은 "
+        "완료 체크포인트는 건너뛰지만 앱 재배포·서버 재시작 시 체크포인트가 사라질 수 있습니다."
+    )
+    st.info(
+        "이 기능은 원자료 수집 전용입니다. 99종목을 모두 수집해도 연구 규칙은 DEV에서 먼저 고정하고 "
+        "REP/OOS를 나중에 개봉합니다. HRF CORE·S1·NEXT는 변경하지 않습니다."
+    )
+
+    flow_batch_universe = st.file_uploader(
+        "승인된 Universe Audit Bundle ZIP",
+        type=["zip"],
+        accept_multiple_files=False,
+        key="flow_batch_universe_zip",
+    )
+
+    fb1, fb2 = st.columns(2)
+    with fb1:
+        flow_batch_count = st.number_input(
+            "수집 종목수",
+            min_value=1,
+            max_value=FLOW_BATCH_TARGET_COUNT,
+            value=FLOW_BATCH_TARGET_COUNT,
+            step=1,
+            help="기본값 99. 운영 점검 때만 줄이고 본 수집은 99로 실행합니다.",
+        )
+    with fb2:
+        st.metric("최종 확정 수급 가능일", str(latest_finalized_flow_date()))
+
+    fbd1, fbd2 = st.columns(2)
+    with fbd1:
+        flow_batch_start = st.date_input(
+            "결합 시작일",
+            value=date(2021, 1, 4),
+            min_value=date(1990, 1, 1),
+            max_value=date.today(),
+            key="flow_batch_start",
+        )
+    with fbd2:
+        flow_batch_end = st.date_input(
+            "결합 종료일",
+            value=latest_finalized_flow_date(),
+            min_value=date(1990, 1, 1),
+            max_value=date.today(),
+            key="flow_batch_end",
+        )
+
+    if flow_batch_universe is not None:
+        try:
+            flow_order, flow_universe_audit = parse_universe_bundle(flow_batch_universe)
+        except Exception as ex:
+            st.error(f"Universe ZIP 해석 실패: {type(ex).__name__}: {ex}")
+            st.stop()
+
+        target_count = int(flow_batch_count)
+        if len(flow_order) < target_count:
+            st.error(
+                f"Universe selection order가 {len(flow_order):,}종목뿐이라 "
+                f"요청한 {target_count}종목을 만들 수 없습니다."
+            )
+            st.stop()
+
+        flow_slice = _flow_batch_sorted_order(flow_order).head(target_count).copy()
+        flow_job_id = flow_batch_job_id(flow_slice, flow_batch_start, flow_batch_end)
+        st.write(
+            f"Universe engine: **{flow_universe_audit.get('engine_build', 'UNKNOWN')}** · "
+            f"수집 대상: **{len(flow_slice)}종목** · "
+            f"selection order: **{int(flow_slice.development_selection_order.min())}~"
+            f"{int(flow_slice.development_selection_order.max())}** · job: **{flow_job_id}**"
+        )
+        show_columns = [column for column in [
+            "development_selection_order", "ticker", "name", "market",
+            "selection_sector", "market_cap_bucket", "selection_stratum",
+        ] if column in flow_slice.columns]
+        st.dataframe(flow_slice[show_columns], use_container_width=True, hide_index=True)
+
+        with st.form("development_flow_batch_run_form", clear_on_submit=False):
+            st.caption(
+                "KRX 로그인은 배치 시작 시 한 번 열고, 세션 오류 때만 재인증합니다. "
+                "ID/PW 값은 CSV·ZIP·audit·체크포인트에 저장하지 않습니다."
+            )
+            flow_batch_krx_id = st.text_input(
+                "KRX ID", value="", key="flow_batch_krx_id_form"
+            )
+            flow_batch_krx_pw = st.text_input(
+                "KRX 비밀번호", value="", type="password", key="flow_batch_krx_pw_form"
+            )
+            run_flow_batch = st.form_submit_button(
+                f"Development {target_count}종목 OHLCV + FLOW 일괄 만들기",
+                type="primary",
+                use_container_width=True,
+            )
+
+        if run_flow_batch:
+            if flow_batch_start > flow_batch_end:
+                st.error("결합 시작일/종료일을 확인하세요.")
+                st.stop()
+            if flow_batch_end > latest_finalized_flow_date():
+                st.error(
+                    f"수급 확정 전 날짜가 포함됐습니다. 종료일을 "
+                    f"{latest_finalized_flow_date()} 이하로 설정하세요."
+                )
+                st.stop()
+            if not flow_batch_krx_id or not flow_batch_krx_pw:
+                st.error("KRX ID와 비밀번호를 모두 입력한 뒤 같은 폼의 실행 버튼을 눌러주세요.")
+                st.stop()
+
+            st.success("KRX ID/PW 입력 감지: YES / YES · 값은 저장하지 않습니다.")
+            flow_progress = st.progress(0, text="99종목 수집 준비 중")
+
+            def flow_batch_progress(value, message):
+                flow_progress.progress(min(max(float(value), 0.0), 1.0), text=message)
+
+            try:
+                flow_payload, flow_manifest, flow_batch_audit = make_development_flow_batch_bundle(
+                    flow_slice,
+                    flow_batch_start,
+                    flow_batch_end,
+                    login_id=flow_batch_krx_id,
+                    login_pw=flow_batch_krx_pw,
+                    progress=flow_batch_progress,
+                )
+            except PermissionError:
+                flow_progress.empty()
+                st.error("KRX 로그인이 거부됐습니다. ID·비밀번호 또는 비밀번호 변경 필요 여부를 확인하세요.")
+                st.stop()
+            except Exception as ex:
+                flow_progress.empty()
+                st.error(f"99종목 결합 배치 실패: {type(ex).__name__}: {ex}")
+                st.caption("같은 ZIP·날짜·종목수로 다시 실행하면 완료 체크포인트부터 재개합니다.")
+                st.stop()
+            flow_progress.empty()
+
+            flow_ok_count = int((flow_manifest["status"] == "OK").sum())
+            flow_reused_count = int(flow_manifest["checkpoint_reused"].sum())
+            if flow_ok_count == len(flow_manifest):
+                st.success(
+                    f"99종목 결합 완료 · 성공 {flow_ok_count}/{len(flow_manifest)} · "
+                    f"체크포인트 재사용 {flow_reused_count}"
+                )
+            else:
+                st.warning(
+                    f"부분 완료 · 성공 {flow_ok_count}/{len(flow_manifest)} · "
+                    f"체크포인트 재사용 {flow_reused_count}. 실패 종목은 0으로 채우지 않았습니다. "
+                    "같은 설정으로 다시 실행하세요."
+                )
+
+            manifest_view_columns = [column for column in [
+                "development_selection_order", "ticker", "name", "status", "rows",
+                "actual_start", "actual_end", "flow_status", "merge_status",
+                "conservation_status", "checkpoint_reused", "elapsed_seconds", "error",
+            ] if column in flow_manifest.columns]
+            st.dataframe(
+                flow_manifest[manifest_view_columns],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            partial_suffix = "" if flow_ok_count == len(flow_manifest) else "_PARTIAL"
+            created = date.today().strftime("%Y%m%d")
+            flow_batch_name = (
+                f"DEV_FLOW_ORD{int(flow_slice.development_selection_order.min()):04d}-"
+                f"{int(flow_slice.development_selection_order.max()):04d}_"
+                f"{flow_batch_start:%Y%m%d}_{flow_batch_end:%Y%m%d}_"
+                f"생성{created}{partial_suffix}.zip"
+            )
+            st.download_button(
+                "99종목 OHLCV + 기관·외국인 수급 ZIP 다운로드",
+                flow_payload,
+                file_name=flow_batch_name,
+                mime="application/zip",
+                use_container_width=True,
+            )
+            st.caption(
+                "ZIP에는 성공 종목별 결합 CSV, batch_manifest.csv, batch_audit.json, "
+                "SHA256_MANIFEST.json이 들어 있습니다. 실패·결측은 0으로 대체하지 않습니다."
+            )
 
 # ---------------------------------------------------------------------
 # STOCK / INDEX — existing v0.9.9 data paths preserved
