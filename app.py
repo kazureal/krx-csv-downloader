@@ -25,7 +25,7 @@ from universe_engine_v0_1_14 import (
     deterministic_selection_order,
 )
 
-st.set_page_config(page_title="Korea OHLCV CSV v1.0.18 UNIVERSE + FLOW 99", page_icon="📈")
+st.set_page_config(page_title="Korea OHLCV CSV v1.0.19 UNIVERSE + FLOW 99", page_icon="📈")
 
 H = {
     "User-Agent": "Mozilla/5.0",
@@ -67,7 +67,7 @@ FLOW_ENGINE_VERSION = "INVESTOR_FLOW_INPUT_v0.3.0_20260902"
 FLOW_BATCH_ENGINE_VERSION = "FLOW_BATCH_v0.2.0_20260902"
 UNIVERSE_DIRECT_ENGINE_VERSION = "UNIVERSE_DIRECT_v0.1.0_20260902"
 FLOW_BATCH_TARGET_COUNT = 99
-FLOW_BATCH_CHECKPOINT_ROOT = Path(tempfile.gettempdir()) / "hrf_flow_batch_v1_0_18"
+FLOW_BATCH_CHECKPOINT_ROOT = Path(tempfile.gettempdir()) / "hrf_flow_batch_v1_0_19"
 UNIVERSE_MARKET_IDS = {"KOSPI": "STK", "KOSDAQ": "KSQ"}
 FLOW_SOURCE = "KRX_VIA_PYKRX_INVESTOR_BY_DATE"
 FLOW_INVESTOR_ALIASES = {
@@ -1134,7 +1134,7 @@ def make_batch_bundle(order_slice, start_date, end_date, login_id="", login_pw="
     files[f"{filename_time_prefix()}_batch_manifest.csv"] = manifest_bytes
 
     audit_obj = {
-        "app_build": "APP_v1.0.18",
+        "app_build": "APP_v1.0.19",
         "engine_build": "UNIVERSE_ENGINE_v0.1.14",
         "batch_start_order": int(order_slice["development_selection_order"].min()),
         "batch_end_order": int(order_slice["development_selection_order"].max()),
@@ -1953,13 +1953,28 @@ def read_ohlcv_upload(uploaded_file):
 
 
 def merge_ohlcv_and_flow_exact(ohlcv, flow):
-    """Merge only when both inputs contain the exact same unique trading dates."""
-    left = ohlcv.copy()
+    """Merge on the exact HRF-valid trading-date set.
+
+    KRX OHLCV can retain suspension/non-trading rows (for audit) while investor-flow
+    endpoints legitimately omit those dates.  HRF indexing excludes them via
+    ``valid_session``.  Therefore exactness is enforced after filtering OHLCV to
+    valid sessions; no missing valid trading date is tolerated.
+    """
+    left_all = ohlcv.copy()
     right = flow.copy()
-    left["date"] = pd.to_datetime(left["date"], errors="coerce")
+    left_all["date"] = pd.to_datetime(left_all["date"], errors="coerce")
     right["date"] = pd.to_datetime(right["date"], errors="coerce")
+
+    if "valid_session" in left_all.columns:
+        valid_mask = left_all["valid_session"].fillna(False).astype(bool)
+        left = left_all.loc[valid_mask].copy()
+    else:
+        left = left_all.copy()
+
     diagnostics = {
-        "ohlcv_rows": int(len(left)),
+        "ohlcv_rows": int(len(left_all)),
+        "ohlcv_valid_rows": int(len(left)),
+        "ohlcv_excluded_rows": int(len(left_all) - len(left)),
         "flow_rows": int(len(right)),
         "common_rows": 0,
         "ohlcv_duplicate_dates": int(left["date"].duplicated().sum()),
@@ -1976,6 +1991,8 @@ def merge_ohlcv_and_flow_exact(ohlcv, flow):
     left_dates = set(left["date"])
     right_dates = set(right["date"])
     diagnostics["common_rows"] = int(len(left_dates & right_dates))
+    diagnostics["missing_flow_valid_dates"] = int(len(left_dates - right_dates))
+    diagnostics["extra_flow_dates"] = int(len(right_dates - left_dates))
     if left_dates != right_dates:
         diagnostics["status"] = "MERGE_DATE_MISMATCH"
         return pd.DataFrame(), diagnostics
@@ -2333,11 +2350,14 @@ def build_development_flow_batch_with_active_session(
                     if flow_attempt == 1:
                         time.sleep(3.0 if flow_sleep_seconds > 0 else 0.0)
 
-                rec["flow_status"] = flow_diagnostics.get("status", "")
-                if flow.empty or rec["flow_status"] != "FLOW_OK":
-                    rec["status"] = rec["flow_status"] or "FLOW_EMPTY"
+                raw_flow_status = flow_diagnostics.get("status", "")
+                rec["flow_status"] = raw_flow_status
+                if flow.empty:
+                    rec["status"] = raw_flow_status or "FLOW_EMPTY"
                 elif not bool(flow["flow_finalized"].all()):
                     rec["status"] = "FLOW_NOT_FINALIZED"
+                elif not bool(flow["flow_input_complete"].all()) or not bool(flow["flow_identity_ok"].all()):
+                    rec["status"] = raw_flow_status or "FLOW_PARTIAL_OR_INVALID"
                 else:
                     merged, merge_diagnostics = merge_ohlcv_and_flow_exact(ohlcv, flow)
                     stock_audit["merge"] = merge_diagnostics
@@ -2345,6 +2365,11 @@ def build_development_flow_batch_with_active_session(
                     if merged.empty or rec["merge_status"] != "MERGE_OK":
                         rec["status"] = rec["merge_status"] or "MERGE_FAILED"
                     else:
+                        # Empty KRX flow chunks are legitimate when OHLCV says those dates
+                        # are non-trading/suspended.  Exact valid-session alignment above is
+                        # the stronger acceptance criterion than per-chunk non-emptiness.
+                        if raw_flow_status != "FLOW_OK":
+                            rec["flow_status"] = "FLOW_OK_VALID_SESSION_ALIGNED"
                         quality = audit_combined_flow_frame(merged)
                         stock_audit["quality_audit"] = quality
                         rec["conservation_status"] = quality.get("status", "")
@@ -2410,7 +2435,7 @@ def build_development_flow_batch_with_active_session(
     manifest_bytes = manifest_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
     files["batch_manifest.csv"] = manifest_bytes
     audit_obj = {
-        "app_build": "APP_v1.0.18",
+        "app_build": "APP_v1.0.19",
         "flow_batch_engine": FLOW_BATCH_ENGINE_VERSION,
         "flow_engine": FLOW_ENGINE_VERSION,
         "job_id": job_id,
@@ -2495,9 +2520,26 @@ def make_development_flow_batch_bundle(
             if hasattr(auth_session, "is_valid") and not auth_session.is_valid():
                 if not reauthenticate():
                     return pd.DataFrame(), {"status": "KRX_SESSION_REFRESH_FAILED"}
-            return fetch_krx_direct_raw_with_active_session(
+            frame, diagnostics = fetch_krx_direct_raw_with_active_session(
                 auth_session, ticker, fetch_start, fetch_end
             )
+            chunks = diagnostics.get("chunks", []) if isinstance(diagnostics, dict) else []
+            recoverable = (
+                frame.empty
+                and isinstance(diagnostics, dict)
+                and (
+                    bool(diagnostics.get("isin_error"))
+                    or any(str(chunk.get("status", "")) == "REQUEST_ERROR" for chunk in chunks)
+                )
+            )
+            if recoverable and reauthenticate():
+                time.sleep(1.0)
+                frame, diagnostics = fetch_krx_direct_raw_with_active_session(
+                    auth_session, ticker, fetch_start, fetch_end
+                )
+                if isinstance(diagnostics, dict):
+                    diagnostics["reauthenticated_after_response_error"] = True
+            return frame, diagnostics
 
         return build_development_flow_batch_with_active_session(
             order_slice,
@@ -2604,9 +2646,26 @@ def make_integrated_universe_flow_batch_bundle(
             if hasattr(auth_session, "is_valid") and not auth_session.is_valid():
                 if not reauthenticate():
                     return pd.DataFrame(), {"status": "KRX_SESSION_REFRESH_FAILED"}
-            return fetch_krx_direct_raw_with_active_session(
+            frame, diagnostics = fetch_krx_direct_raw_with_active_session(
                 auth_session, ticker, fetch_start, fetch_end
             )
+            chunks = diagnostics.get("chunks", []) if isinstance(diagnostics, dict) else []
+            recoverable = (
+                frame.empty
+                and isinstance(diagnostics, dict)
+                and (
+                    bool(diagnostics.get("isin_error"))
+                    or any(str(chunk.get("status", "")) == "REQUEST_ERROR" for chunk in chunks)
+                )
+            )
+            if recoverable and reauthenticate():
+                time.sleep(1.0)
+                frame, diagnostics = fetch_krx_direct_raw_with_active_session(
+                    auth_session, ticker, fetch_start, fetch_end
+                )
+                if isinstance(diagnostics, dict):
+                    diagnostics["reauthenticated_after_response_error"] = True
+            return frame, diagnostics
 
         def batch_progress(value, message):
             if progress:
@@ -2655,14 +2714,14 @@ def fetch_flow_cached(ticker, start, end):
     return fetch_investor_flow_by_date(ticker, start, end)
 
 
-st.title("Korea OHLCV CSV v1.0.18 UNIVERSE + OHLCV + FLOW 99")
+st.title("Korea OHLCV CSV v1.0.19 UNIVERSE + OHLCV + FLOW 99")
 st.caption(
     "개별주식 KRX DIRECT RAW + KOSPI/KOSDAQ 지수(FDR) + "
     "Track 02 Development Universe · 99종목 일괄 수집 · 원본 보존 · outcome-blind"
 )
 
 st.caption(
-    "BUILD: APP_v1.0.18 / UNIVERSE_DIRECT_v0.1.0 / "
+    "BUILD: APP_v1.0.19 / UNIVERSE_DIRECT_v0.1.0 / "
     "BATCH_OHLCV_v0.6 / INVESTOR_FLOW_INPUT_v0.3.0 / FLOW_BATCH_v0.2.0"
 )
 
