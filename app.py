@@ -7,6 +7,7 @@ import hashlib
 import math
 import xml.etree.ElementTree as ET
 from datetime import date, timedelta, datetime
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import requests
@@ -14,7 +15,7 @@ import streamlit as st
 
 from universe_engine_v0_1_14 import UniverseConfig, build_universe
 
-st.set_page_config(page_title="Korea OHLCV CSV v1.0.14A TRACK02 DATA ADDENDUM", page_icon="📈")
+st.set_page_config(page_title="Korea OHLCV CSV v1.0.15 + INVESTOR FLOW", page_icon="📈")
 
 H = {
     "User-Agent": "Mozilla/5.0",
@@ -51,6 +52,19 @@ KRX_LOGIN_PAGE = "https://data.krx.co.kr/contents/MDC/COMS/client/MDCCOMS001.cmd
 KRX_LOGIN_JSP = "https://data.krx.co.kr/contents/MDC/COMS/client/view/login.jsp?site=mdc"
 KRX_LOGIN_URL = "https://data.krx.co.kr/contents/MDC/COMS/client/MDCCOMS001D1.cmd"
 KRX_REFERER = "https://data.krx.co.kr/contents/MDC/MDI/outerLoader/index.cmd"
+
+FLOW_ENGINE_VERSION = "INVESTOR_FLOW_INPUT_v0.1.1_20260902"
+FLOW_SOURCE = "KRX_VIA_PYKRX_INVESTOR_BY_DATE"
+FLOW_INVESTOR_ALIASES = {
+    "institution": ("기관합계", "기관", "institution", "institution_total"),
+    "foreign": ("외국인합계", "외국인", "foreign", "foreign_total"),
+    "individual": ("개인", "individual", "retail"),
+    "other_corporation": ("기타법인", "other_corporation", "corporation"),
+}
+FLOW_SIDES = {"buy": "매수", "sell": "매도", "net": None}
+FLOW_METRICS = ("qty", "value")
+FLOW_CORE_INVESTORS = ("institution", "foreign")
+FLOW_ALL_INVESTORS = ("institution", "foreign", "individual", "other_corporation")
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -1196,24 +1210,480 @@ def make_csv_filename(name, df, partial=False):
     return f"{filename_time_prefix()}_{safe_filename_piece(name)}_{start}_{end}_생성{created}{suffix}.csv"
 
 
-st.title("Korea OHLCV CSV v1.0.14 STOCK + INDEX + UNIVERSE + BATCH")
+# ---------------------------------------------------------------------
+# INVESTOR FLOW INPUT — external diagnostic only; HRF CORE is untouched
+# ---------------------------------------------------------------------
+def _flow_chunk_ranges(start, end, max_days=365):
+    if start > end:
+        raise ValueError("시작일이 종료일보다 늦습니다.")
+    current = start
+    while current <= end:
+        chunk_end = min(current + timedelta(days=max_days - 1), end)
+        yield current, chunk_end
+        current = chunk_end + timedelta(days=1)
+
+
+def _find_flow_investor_column(columns, investor):
+    normalized = {str(column).strip().lower(): column for column in columns}
+    for alias in FLOW_INVESTOR_ALIASES[investor]:
+        hit = normalized.get(alias.lower())
+        if hit is not None:
+            return hit
+    return None
+
+
+def normalize_investor_frame(frame, metric, side):
+    if metric not in FLOW_METRICS:
+        raise ValueError(f"지원하지 않는 metric: {metric}")
+    if side not in FLOW_SIDES:
+        raise ValueError(f"지원하지 않는 side: {side}")
+    if frame is None or frame.empty:
+        return pd.DataFrame(columns=["date"])
+
+    work = frame.reset_index().copy()
+    date_col = next(
+        (column for column in work.columns if str(column).strip().lower() in {"날짜", "date"}),
+        work.columns[0],
+    )
+    out = pd.DataFrame({"date": pd.to_datetime(work[date_col], errors="coerce")})
+    for investor in FLOW_ALL_INVESTORS:
+        source_col = _find_flow_investor_column(work.columns, investor)
+        if source_col is not None:
+            out[f"{investor}_{side}_{metric}"] = pd.to_numeric(work[source_col], errors="coerce")
+    return out.dropna(subset=["date"]).sort_values("date").drop_duplicates("date", keep="last")
+
+
+def assemble_flow_frames(frames):
+    merged = None
+    for metric in FLOW_METRICS:
+        for side in FLOW_SIDES:
+            normalized = normalize_investor_frame(frames.get((metric, side)), metric, side)
+            merged = normalized if merged is None else merged.merge(normalized, on="date", how="outer")
+
+    if merged is None or merged.empty:
+        return pd.DataFrame()
+
+    expected = [
+        f"{investor}_{side}_{metric}"
+        for investor in FLOW_ALL_INVESTORS
+        for metric in FLOW_METRICS
+        for side in FLOW_SIDES
+    ]
+    for column in expected:
+        if column not in merged.columns:
+            merged[column] = pd.NA
+        merged[column] = pd.to_numeric(merged[column], errors="coerce").round().astype("Int64")
+
+    identity_columns = []
+    for investor in FLOW_ALL_INVESTORS:
+        for metric in FLOW_METRICS:
+            buy = f"{investor}_buy_{metric}"
+            sell = f"{investor}_sell_{metric}"
+            net = f"{investor}_net_{metric}"
+            ok_col = f"{investor}_{metric}_identity_ok"
+            complete = merged[[buy, sell, net]].notna().all(axis=1)
+            merged[ok_col] = complete & ((merged[buy] - merged[sell]) == merged[net])
+            identity_columns.append(ok_col)
+
+    core_columns = [
+        f"{investor}_{side}_{metric}"
+        for investor in FLOW_CORE_INVESTORS
+        for metric in FLOW_METRICS
+        for side in FLOW_SIDES
+    ]
+    merged["flow_input_complete"] = merged[core_columns].notna().all(axis=1)
+    merged["flow_identity_ok"] = merged[identity_columns].all(axis=1)
+
+    for investor in FLOW_CORE_INVESTORS:
+        buy_qty = pd.to_numeric(merged[f"{investor}_buy_qty"], errors="coerce")
+        buy_value = pd.to_numeric(merged[f"{investor}_buy_value"], errors="coerce")
+        merged[f"{investor}_gross_buy_avg_price"] = (
+            buy_value / buy_qty.where(buy_qty > 0)
+        ).astype("Float64")
+
+    merged["flow_source"] = FLOW_SOURCE
+    merged["flow_engine_version"] = FLOW_ENGINE_VERSION
+    return merged.sort_values("date").drop_duplicates("date", keep="last").reset_index(drop=True)
+
+
+def add_flow_finalization_flag(flow, now_kst=None):
+    out = flow.copy()
+    now = now_kst or datetime.now(ZoneInfo("Asia/Seoul"))
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=ZoneInfo("Asia/Seoul"))
+    else:
+        now = now.astimezone(ZoneInfo("Asia/Seoul"))
+    dates = pd.to_datetime(out["date"], errors="coerce").dt.date
+    out["flow_finalized"] = (dates < now.date()) | ((dates == now.date()) & (now.hour >= 18))
+    return out
+
+
+def fetch_investor_flow_by_date(ticker, start, end, max_days=365, sleep_seconds=0.10):
+    if not re.fullmatch(r"\d{6}", str(ticker)):
+        raise ValueError("ticker는 6자리 종목코드여야 합니다.")
+    try:
+        import pykrx
+        from pykrx import stock
+    except Exception as ex:
+        raise RuntimeError("pykrx를 불러오지 못했습니다. requirements.txt를 확인하세요.") from ex
+
+    diagnostics = {
+        "flow_engine_version": FLOW_ENGINE_VERSION,
+        "source": FLOW_SOURCE,
+        "pykrx_version": getattr(pykrx, "__version__", "unknown"),
+        "ticker": ticker,
+        "requested_start": str(start),
+        "requested_end": str(end),
+        "calls": [],
+        "status": "",
+    }
+    chunk_frames = []
+    for chunk_start, chunk_end in _flow_chunk_ranges(start, end, max_days=max_days):
+        raw_frames = {}
+        for metric in FLOW_METRICS:
+            function = (
+                stock.get_market_trading_volume_by_date
+                if metric == "qty"
+                else stock.get_market_trading_value_by_date
+            )
+            for side, krx_side in FLOW_SIDES.items():
+                record = {
+                    "start": str(chunk_start),
+                    "end": str(chunk_end),
+                    "metric": metric,
+                    "side": side,
+                    "rows": 0,
+                    "status": "",
+                    "error": "",
+                }
+                try:
+                    args = (chunk_start.strftime("%Y%m%d"), chunk_end.strftime("%Y%m%d"), ticker)
+                    frame = function(*args) if krx_side is None else function(*args, on=krx_side)
+                    if frame is None or frame.empty:
+                        record["status"] = "EMPTY"
+                        raw_frames[(metric, side)] = pd.DataFrame()
+                    else:
+                        record["rows"] = int(len(frame))
+                        probe = normalize_investor_frame(frame, metric, side)
+                        required = {f"institution_{side}_{metric}", f"foreign_{side}_{metric}"}
+                        if required.issubset(probe.columns):
+                            record["status"] = "OK"
+                        else:
+                            record["status"] = "SCHEMA_ERROR"
+                            record["error"] = f"columns={list(map(str, frame.columns))}"
+                        raw_frames[(metric, side)] = frame
+                except Exception as ex:
+                    record["status"] = "ERROR"
+                    record["error"] = f"{type(ex).__name__}: {ex}"
+                    raw_frames[(metric, side)] = pd.DataFrame()
+                diagnostics["calls"].append(record)
+                if sleep_seconds > 0:
+                    time.sleep(sleep_seconds)
+
+        chunk = assemble_flow_frames(raw_frames)
+        if not chunk.empty:
+            chunk_frames.append(chunk)
+
+    if not chunk_frames:
+        diagnostics["status"] = "FLOW_EMPTY"
+        return pd.DataFrame(), diagnostics
+
+    out = pd.concat(chunk_frames, ignore_index=True)
+    out = out.sort_values("date").drop_duplicates("date", keep="last").reset_index(drop=True)
+    out = add_flow_finalization_flag(out)
+    statuses = [str(record["status"]) for record in diagnostics["calls"]]
+    all_calls_ok = bool(statuses) and all(status == "OK" for status in statuses)
+    all_rows_complete = bool(out["flow_input_complete"].all())
+    all_identities_ok = bool(out["flow_identity_ok"].all())
+    diagnostics["status"] = (
+        "FLOW_OK" if all_calls_ok and all_rows_complete and all_identities_ok
+        else "FLOW_PARTIAL_OR_INVALID"
+    )
+    diagnostics["rows"] = int(len(out))
+    diagnostics["actual_start"] = str(out["date"].min().date())
+    diagnostics["actual_end"] = str(out["date"].max().date())
+    diagnostics["incomplete_rows"] = int((~out["flow_input_complete"]).sum())
+    diagnostics["identity_failure_rows"] = int((~out["flow_identity_ok"]).sum())
+    diagnostics["provisional_rows"] = int((~out["flow_finalized"]).sum())
+    return out, diagnostics
+
+
+def _flow_weighted_std(values, weights, mean):
+    denominator = float(weights.sum())
+    if denominator <= 0:
+        return math.nan
+    variance = float((weights * (values - mean) ** 2).sum()) / denominator
+    return math.sqrt(max(variance, 0.0))
+
+
+def positive_net_cost_proxy_summary(flow):
+    rows = []
+    for investor, label in (("institution", "기관합계"), ("foreign", "외국인합계")):
+        required = [f"{investor}_buy_qty", f"{investor}_buy_value", f"{investor}_net_qty"]
+        if not all(column in flow.columns for column in required):
+            continue
+        buy_qty = pd.to_numeric(flow[required[0]], errors="coerce")
+        buy_value = pd.to_numeric(flow[required[1]], errors="coerce")
+        net_qty = pd.to_numeric(flow[required[2]], errors="coerce")
+        daily_price = buy_value / buy_qty.where(buy_qty > 0)
+        eligible = (
+            flow["flow_input_complete"]
+            & flow["flow_identity_ok"]
+            & (net_qty > 0)
+            & daily_price.notna()
+        )
+        prices = daily_price[eligible].astype(float)
+        weights = net_qty[eligible].astype(float)
+        total_weight = float(weights.sum())
+        proxy = float((prices * weights).sum() / total_weight) if total_weight > 0 else math.nan
+        dispersion = _flow_weighted_std(prices, weights, proxy) if total_weight > 0 else math.nan
+        rows.append({
+            "investor": label,
+            "positive_net_days": int(eligible.sum()),
+            "positive_net_qty": int(total_weight) if total_weight > 0 else 0,
+            "selected_range_net_qty": int(net_qty.fillna(0).sum()),
+            "positive_net_addition_price_proxy": proxy,
+            "weighted_daily_price_dispersion": dispersion,
+        })
+    return pd.DataFrame(rows)
+
+
+def read_ohlcv_upload(uploaded_file):
+    raw = uploaded_file.getvalue()
+    parsed = None
+    for encoding in ("utf-8-sig", "cp949", "euc-kr", "utf-8"):
+        try:
+            parsed = pd.read_csv(io.BytesIO(raw), encoding=encoding)
+            break
+        except UnicodeDecodeError:
+            continue
+    if parsed is None:
+        raise ValueError("OHLCV CSV 인코딩을 읽지 못했습니다.")
+    parsed.columns = [str(column).strip().lower() for column in parsed.columns]
+    parsed = parsed.rename(columns={
+        "날짜": "date", "시가": "open", "고가": "high", "저가": "low",
+        "종가": "close", "거래량": "volume",
+    })
+    required = ["date", "open", "high", "low", "close", "volume"]
+    missing = [column for column in required if column not in parsed.columns]
+    if missing:
+        raise ValueError(f"OHLCV 필수 열 누락: {missing}")
+    # Audit 열은 버리지 않고 그대로 보존한 채 필수 열만 형식 검증한다.
+    parsed["date"] = pd.to_datetime(parsed["date"], errors="coerce")
+    for column in required[1:]:
+        parsed[column] = pd.to_numeric(parsed[column], errors="coerce")
+    return parsed.dropna(subset=required).sort_values("date").drop_duplicates("date", keep="last")
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_flow_cached(ticker, start, end):
+    return fetch_investor_flow_by_date(ticker, start, end)
+
+
+st.title("Korea OHLCV CSV v1.0.15 STOCK + INDEX + UNIVERSE + BATCH + FLOW")
 st.caption(
     "개별주식 KRX DIRECT RAW + KOSPI/KOSDAQ 지수(FDR) + "
     "Track 02 Development Universe · 원본 보존 · outcome-blind"
 )
 
-st.caption("BUILD: APP_v1.0.14 / UNIVERSE_ENGINE_v0.1.14 / BATCH_OHLCV_v0.6")
+st.caption(
+    "BUILD: APP_v1.0.15 / UNIVERSE_ENGINE_v0.1.14 / "
+    "BATCH_OHLCV_v0.6 / INVESTOR_FLOW_INPUT_v0.1.1"
+)
 
 data_kind = st.radio(
     "수집 대상",
-    ["개별주식", "시장지수", "Development Universe", "Development Batch OHLCV"],
+    ["개별주식", "기관·외국인 수급", "시장지수", "Development Universe", "Development Batch OHLCV"],
     horizontal=True,
 )
 
 # ---------------------------------------------------------------------
+# INVESTOR FLOW
+# ---------------------------------------------------------------------
+if data_kind == "기관·외국인 수급":
+    st.info(
+        "기관합계·외국인합계의 일별 매수/매도/순매수 수량과 금액을 수집합니다. "
+        "이 기능은 HRF Living Map v1.0 CORE와 분리된 외부 진단 입력이며 S1/NEXT를 변경하지 않습니다."
+    )
+    flow_query = st.text_input(
+        "종목명 또는 6자리 종목코드",
+        value="삼성전자",
+        key="flow_query",
+    )
+    flow_left, flow_right = st.columns(2)
+    with flow_left:
+        flow_start = st.date_input(
+            "수급 시작일",
+            value=date(2021, 1, 4),
+            min_value=date(1990, 1, 1),
+            max_value=date.today(),
+            key="flow_start",
+        )
+    with flow_right:
+        flow_end = st.date_input(
+            "수급 종료일",
+            value=date.today(),
+            min_value=date(1990, 1, 1),
+            max_value=date.today(),
+            key="flow_end",
+        )
+
+    flow_ohlcv_upload = st.file_uploader(
+        "기존 앱에서 받은 OHLCV CSV 연결",
+        type=["csv"],
+        help="삼성전자 OHLCV CSV를 먼저 선택하면 수급과 날짜별로 결합한 연구입력 CSV까지 만듭니다.",
+        key="flow_ohlcv_upload",
+    )
+    st.warning(
+        "원가 후보는 실제 기관·외국인 보유잔고 원가가 아닙니다. "
+        "양(+) 순매수일의 일별 매수금액÷매수수량을 양(+) 순매수수량으로 가중한 연구용 후보치입니다."
+    )
+
+    if st.button("기관·외국인 수급 + 결합 CSV 만들기", type="primary", use_container_width=True):
+        if flow_start > flow_end:
+            st.error("수급 시작일과 종료일을 확인하세요.")
+            st.stop()
+
+        flow_security = resolve(flow_query)
+        if not flow_security:
+            st.error("종목을 찾지 못했습니다. 종목명 또는 6자리 종목코드를 확인해 주세요.")
+            st.stop()
+
+        try:
+            with st.spinner("KRX 투자자별 수량·금액을 구간별로 수집하고 검산하는 중입니다."):
+                flow, flow_diagnostics = fetch_flow_cached(
+                    flow_security["code"], flow_start, flow_end
+                )
+        except Exception as ex:
+            st.error(f"수급 수집 실패: {type(ex).__name__}: {ex}")
+            st.stop()
+
+        st.write(f"종목: **{flow_security['name']} ({flow_security['code']})**")
+        st.write(
+            f"상태: **{flow_diagnostics.get('status', '')}** · "
+            f"pykrx: **{flow_diagnostics.get('pykrx_version', 'unknown')}**"
+        )
+        flow_calls = pd.DataFrame(flow_diagnostics.get("calls", []))
+        if not flow_calls.empty:
+            with st.expander(
+                "KRX 수급 분할수집 로그",
+                expanded=flow_diagnostics.get("status") != "FLOW_OK",
+            ):
+                st.dataframe(flow_calls, use_container_width=True, hide_index=True)
+
+        if flow.empty:
+            st.error("수급 응답이 비었습니다. 빈 응답을 0으로 대체하지 않았습니다.")
+            st.stop()
+
+        flow_ok = flow_diagnostics.get("status") == "FLOW_OK"
+        if flow_ok:
+            st.success(f"{len(flow):,}개 거래일 수급 수집 및 항등식 검산 통과")
+        else:
+            st.error(
+                "일부 호출·스키마 또는 매수-매도=순매수 검산에 실패했습니다. "
+                "이 출력은 완성 연구 입력으로 사용하지 마세요."
+            )
+
+        provisional_rows = int((~flow["flow_finalized"]).sum())
+        if provisional_rows:
+            st.warning(
+                f"오후 6시 이전 당일 수급 {provisional_rows}행은 provisional입니다. "
+                "종가 연구에는 18:00 KST 이후 다시 받으세요."
+            )
+
+        flow_summary = positive_net_cost_proxy_summary(flow)
+        if not flow_summary.empty:
+            flow_summary_view = flow_summary.copy()
+            for column in ("positive_net_addition_price_proxy", "weighted_daily_price_dispersion"):
+                flow_summary_view[column] = flow_summary_view[column].round(2)
+            st.markdown("#### 선택 기간 양(+) 순매수 원가 후보")
+            st.dataframe(flow_summary_view, use_container_width=True, hide_index=True)
+
+        flow_preview_columns = [
+            "date",
+            "institution_net_qty",
+            "institution_net_value",
+            "institution_gross_buy_avg_price",
+            "foreign_net_qty",
+            "foreign_net_value",
+            "foreign_gross_buy_avg_price",
+            "flow_input_complete",
+            "flow_identity_ok",
+            "flow_finalized",
+        ]
+        st.markdown("#### 최근 수급")
+        st.dataframe(flow[flow_preview_columns].tail(30), use_container_width=True, hide_index=True)
+
+        flow_export = flow.copy()
+        flow_export["date"] = pd.to_datetime(flow_export["date"]).dt.strftime("%Y-%m-%d")
+        flow_payload = flow_export.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+        flow_suffix = "" if flow_ok and provisional_rows == 0 else "_NOT_RESEARCH_READY"
+        st.download_button(
+            "수급 원자료 CSV 다운로드",
+            flow_payload,
+            file_name=(
+                f"{flow_security['code']}_{flow_start:%Y%m%d}_{flow_end:%Y%m%d}"
+                f"_investor_flow{flow_suffix}.csv"
+            ),
+            mime="text/csv",
+            use_container_width=True,
+        )
+
+        if flow_ohlcv_upload is None:
+            st.info("결합 CSV가 필요하면 위에서 삼성전자 OHLCV CSV를 선택한 뒤 버튼을 다시 누르세요.")
+        elif not flow_ok or provisional_rows:
+            st.error("수급 데이터가 완전 확정되지 않아 OHLCV 결합 연구파일 생성을 차단했습니다.")
+        else:
+            try:
+                flow_ohlcv = read_ohlcv_upload(flow_ohlcv_upload)
+                merged_flow = flow_ohlcv.merge(
+                    flow,
+                    on="date",
+                    how="inner",
+                    validate="one_to_one",
+                )
+                ohlcv_dates = set(flow_ohlcv["date"])
+                flow_dates = set(pd.to_datetime(flow["date"]))
+                exact_date_match = ohlcv_dates == flow_dates
+                if merged_flow.empty:
+                    st.error("OHLCV와 수급의 공통 날짜가 없습니다.")
+                elif not exact_date_match:
+                    st.error(
+                        f"날짜 불일치: OHLCV {len(flow_ohlcv):,}행 · 수급 {len(flow):,}행 · "
+                        f"공통 {len(merged_flow):,}행. 결합 파일 생성을 차단했습니다."
+                    )
+                else:
+                    merged_export = merged_flow.copy()
+                    merged_export["date"] = merged_export["date"].dt.strftime("%Y-%m-%d")
+                    merged_payload = merged_export.to_csv(
+                        index=False, encoding="utf-8-sig"
+                    ).encode("utf-8-sig")
+                    st.success(
+                        f"OHLCV와 수급의 날짜가 전부 일치했습니다: **{len(merged_flow):,}거래일**"
+                    )
+                    st.download_button(
+                        "OHLCV + 수급 연구입력 CSV 다운로드",
+                        merged_payload,
+                        file_name=(
+                            f"{flow_security['code']}_{flow_start:%Y%m%d}_{flow_end:%Y%m%d}"
+                            "_ohlcv_investor_flow.csv"
+                        ),
+                        mime="text/csv",
+                        use_container_width=True,
+                    )
+            except Exception as ex:
+                st.error(f"OHLCV 병합 실패: {type(ex).__name__}: {ex}")
+
+    st.divider()
+    st.caption(
+        "연구 경계: 단순 가격 평균과 순매수금액÷순매수수량은 실제 원가로 사용하지 않습니다. "
+        "수급 Episode 규칙과 OOS 검증 전에는 매매 신호로 승격하지 않습니다."
+    )
+
+# ---------------------------------------------------------------------
 # DEVELOPMENT UNIVERSE
 # ---------------------------------------------------------------------
-if data_kind == "Development Universe":
+elif data_kind == "Development Universe":
     st.info(
         "Track 02용 point-in-time 후보군을 만듭니다. "
         "H15/MFE/MAE 등 미래 outcome은 사용하지 않습니다."
