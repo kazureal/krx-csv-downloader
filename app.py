@@ -17,9 +17,15 @@ import pandas as pd
 import requests
 import streamlit as st
 
-from universe_engine_v0_1_14 import UniverseConfig, build_universe
+from universe_engine_v0_1_14 import (
+    UniverseConfig,
+    add_structural_strata,
+    build_universe,
+    classify_common_stock_candidates,
+    deterministic_selection_order,
+)
 
-st.set_page_config(page_title="Korea OHLCV CSV v1.0.17 FLOW BATCH 99", page_icon="📈")
+st.set_page_config(page_title="Korea OHLCV CSV v1.0.18 UNIVERSE + FLOW 99", page_icon="📈")
 
 H = {
     "User-Agent": "Mozilla/5.0",
@@ -58,9 +64,11 @@ KRX_LOGIN_URL = "https://data.krx.co.kr/contents/MDC/COMS/client/MDCCOMS001D1.cm
 KRX_REFERER = "https://data.krx.co.kr/contents/MDC/MDI/outerLoader/index.cmd"
 
 FLOW_ENGINE_VERSION = "INVESTOR_FLOW_INPUT_v0.3.0_20260902"
-FLOW_BATCH_ENGINE_VERSION = "FLOW_BATCH_v0.1.0_20260902"
+FLOW_BATCH_ENGINE_VERSION = "FLOW_BATCH_v0.2.0_20260902"
+UNIVERSE_DIRECT_ENGINE_VERSION = "UNIVERSE_DIRECT_v0.1.0_20260902"
 FLOW_BATCH_TARGET_COUNT = 99
-FLOW_BATCH_CHECKPOINT_ROOT = Path(tempfile.gettempdir()) / "hrf_flow_batch_v1_0_17"
+FLOW_BATCH_CHECKPOINT_ROOT = Path(tempfile.gettempdir()) / "hrf_flow_batch_v1_0_18"
+UNIVERSE_MARKET_IDS = {"KOSPI": "STK", "KOSDAQ": "KSQ"}
 FLOW_SOURCE = "KRX_VIA_PYKRX_INVESTOR_BY_DATE"
 FLOW_INVESTOR_ALIASES = {
     "institution": ("기관합계", "기관", "institution", "institution_total"),
@@ -228,6 +236,384 @@ def _clean_krx_num(v):
     if s in ("", "-", "None", "nan"):
         return None
     return pd.to_numeric(s, errors="coerce")
+
+
+def _first_existing_column(frame, candidates):
+    return next((column for column in candidates if column in frame.columns), None)
+
+
+def _normalize_krx_universe_price_rows(rows, market):
+    """Normalize official KRX MDCSTAT01501 rows without pykrx column assumptions."""
+    columns = [
+        "ticker", "name", "market", "sector", "close_capapi", "volume",
+        "trading_value", "listed_shares", "market_cap_capapi",
+    ]
+    if not rows:
+        return pd.DataFrame(columns=columns)
+
+    raw = pd.DataFrame(rows)
+    aliases = {
+        "ticker": ("ISU_SRT_CD", "종목코드", "ticker", "Code"),
+        "name": ("ISU_ABBRV", "종목명", "name", "Name"),
+        "sector": ("SECT_TP_NM", "소속부", "sector", "Sector"),
+        "close_capapi": ("TDD_CLSPRC", "종가", "close", "Close"),
+        "volume": ("ACC_TRDVOL", "거래량", "volume", "Volume"),
+        "trading_value": ("ACC_TRDVAL", "거래대금", "trading_value", "Amount"),
+        "listed_shares": ("LIST_SHRS", "상장주식수", "listed_shares", "Stocks"),
+        "market_cap_capapi": ("MKTCAP", "시가총액", "market_cap", "Marcap"),
+    }
+    out = pd.DataFrame(index=raw.index)
+    for target, candidates in aliases.items():
+        source = _first_existing_column(raw, candidates)
+        out[target] = raw[source] if source is not None else pd.NA
+
+    out["ticker"] = (
+        out["ticker"].astype(str).str.extract(r"(\d{6})", expand=False)
+        .fillna(out["ticker"].astype(str)).str.zfill(6)
+    )
+    out["name"] = out["name"].fillna("").astype(str)
+    out["sector"] = out["sector"].fillna("SECTOR_UNKNOWN").astype(str)
+    out["market"] = str(market)
+    numeric = [
+        "close_capapi", "volume", "trading_value", "listed_shares",
+        "market_cap_capapi",
+    ]
+    for column in numeric:
+        out[column] = out[column].map(_clean_krx_num)
+    out = out[
+        out["ticker"].str.fullmatch(r"\d{6}", na=False)
+        & (pd.to_numeric(out["market_cap_capapi"], errors="coerce").fillna(0) > 0)
+    ].copy()
+    return out[columns].drop_duplicates(["market", "ticker"], keep="first").reset_index(drop=True)
+
+
+def _normalize_krx_universe_sector_rows(rows, market):
+    """Normalize official KRX MDCSTAT03901 historical sector rows."""
+    columns = ["ticker", "market", "sector_name", "industry"]
+    if not rows:
+        return pd.DataFrame(columns=columns)
+    raw = pd.DataFrame(rows)
+    ticker_column = _first_existing_column(raw, ("ISU_SRT_CD", "종목코드", "ticker"))
+    if ticker_column is None:
+        return pd.DataFrame(columns=columns)
+    name_column = _first_existing_column(raw, ("ISU_ABBRV", "종목명", "name"))
+    industry_column = _first_existing_column(raw, ("IDX_IND_NM", "업종명", "industry"))
+    out = pd.DataFrame(index=raw.index)
+    out["ticker"] = (
+        raw[ticker_column].astype(str).str.extract(r"(\d{6})", expand=False)
+        .fillna(raw[ticker_column].astype(str)).str.zfill(6)
+    )
+    out["market"] = str(market)
+    out["sector_name"] = raw[name_column].fillna("").astype(str) if name_column else ""
+    out["industry"] = (
+        raw[industry_column].fillna("").astype(str) if industry_column else ""
+    )
+    out = out[out["ticker"].str.fullmatch(r"\d{6}", na=False)].copy()
+    return out[columns].drop_duplicates(["market", "ticker"], keep="first").reset_index(drop=True)
+
+
+def _krx_response_rows(data, preferred_keys):
+    if not isinstance(data, dict):
+        return []
+    first_empty = None
+    for key in preferred_keys:
+        value = data.get(key)
+        if isinstance(value, list):
+            if value:
+                return value
+            if first_empty is None:
+                first_empty = value
+    return first_empty or []
+
+
+def fetch_krx_direct_universe_snapshot(
+    session,
+    reference_date,
+    markets=("KOSPI", "KOSDAQ"),
+    max_back_days=14,
+    progress=None,
+):
+    """
+    Build a point-in-time snapshot from official KRX JSON endpoints.
+
+    The date is probed backwards only until both requested markets have a
+    non-empty snapshot. This fixes the pykrx 1.2.8 schema failure while keeping
+    historical reference dates historical. No current listing is substituted.
+    """
+    requested = pd.Timestamp(reference_date).date()
+    diagnostics = {
+        "engine_build": UNIVERSE_DIRECT_ENGINE_VERSION,
+        "requested_reference_date": requested.strftime("%Y%m%d"),
+        "markets": list(markets),
+        "snapshot_source": "KRX_MDCSTAT01501_DIRECT",
+        "sector_source": "KRX_MDCSTAT03901_DIRECT_SAME_REFERENCE_DATE",
+        "common_stock_crosscheck_source": (
+            "KRX_MDCSTAT01501_STOCK_MARKET_MEMBERSHIP_PLUS_NAME_PATTERN"
+        ),
+        "snapshot_probes": [],
+        "errors": [],
+        "credentials_stored": False,
+        "outcomes_opened": False,
+        "future_outcomes_opened": False,
+    }
+    price_frames = []
+    resolved = None
+
+    for back in range(int(max_back_days) + 1):
+        candidate = requested - timedelta(days=back)
+        candidate_text = candidate.strftime("%Y%m%d")
+        day_frames = []
+        day_record = {"date": candidate_text, "markets": []}
+        for market in markets:
+            market_id = UNIVERSE_MARKET_IDS.get(str(market))
+            if not market_id:
+                raise ValueError(f"지원하지 않는 Universe 시장: {market}")
+            payload = {
+                "bld": "dbms/MDC/STAT/standard/MDCSTAT01501",
+                "mktId": market_id,
+                "trdDd": candidate_text,
+            }
+            record = {"market": market, "rows": 0, "status": ""}
+            try:
+                response = session.post(
+                    KRX_JSON_URL, data=payload, headers=_krx_headers(), timeout=30
+                )
+                response.raise_for_status()
+                data = response.json()
+                rows = _krx_response_rows(data, ("output", "block1", "OutBlock_1"))
+                normalized = _normalize_krx_universe_price_rows(rows, market)
+                record["rows"] = int(len(normalized))
+                record["status"] = "OK" if not normalized.empty else "EMPTY"
+                record["krx_error_code"] = str(data.get("_error_code", ""))
+                if not normalized.empty:
+                    day_frames.append(normalized)
+            except Exception as ex:
+                record["status"] = "ERROR"
+                record["error"] = f"{type(ex).__name__}: {ex}"
+            day_record["markets"].append(record)
+        diagnostics["snapshot_probes"].append(day_record)
+
+        found_markets = {str(frame["market"].iloc[0]) for frame in day_frames if not frame.empty}
+        if found_markets == set(map(str, markets)):
+            price_frames = day_frames
+            resolved = candidate
+            break
+        if progress:
+            progress(0.01, f"Universe 거래일 확인 중 · {candidate_text}")
+
+    if resolved is None or not price_frames:
+        diagnostics["snapshot_failure"] = (
+            f"최근 {int(max_back_days) + 1}일 안에서 KOSPI/KOSDAQ 동시 스냅샷을 찾지 못했습니다."
+        )
+        return pd.DataFrame(), diagnostics
+
+    resolved_text = resolved.strftime("%Y%m%d")
+    diagnostics["resolved_reference_business_day"] = resolved_text
+    snapshot = pd.concat(price_frames, ignore_index=True)
+
+    sector_frames = []
+    for market in markets:
+        payload = {
+            "bld": "dbms/MDC/STAT/standard/MDCSTAT03901",
+            "mktId": UNIVERSE_MARKET_IDS[str(market)],
+            "trdDd": resolved_text,
+        }
+        try:
+            response = session.post(
+                KRX_JSON_URL, data=payload, headers=_krx_headers(), timeout=30
+            )
+            response.raise_for_status()
+            data = response.json()
+            rows = _krx_response_rows(data, ("block1", "output", "OutBlock_1"))
+            normalized = _normalize_krx_universe_sector_rows(rows, market)
+            diagnostics.setdefault("sector_rows", []).append({
+                "market": market,
+                "rows": int(len(normalized)),
+                "krx_error_code": str(data.get("_error_code", "")),
+            })
+            if not normalized.empty:
+                sector_frames.append(normalized)
+        except Exception as ex:
+            diagnostics["errors"].append({
+                "stage": "sector_direct",
+                "market": market,
+                "error": f"{type(ex).__name__}: {ex}",
+            })
+
+    if sector_frames:
+        sectors = pd.concat(sector_frames, ignore_index=True)
+        snapshot = snapshot.merge(sectors, on=["market", "ticker"], how="left")
+        snapshot["name"] = snapshot["sector_name"].where(
+            snapshot["sector_name"].fillna("").ne(""), snapshot["name"]
+        )
+        snapshot = snapshot.drop(columns=["sector_name"])
+        snapshot["industry"] = snapshot["industry"].fillna("").astype(str)
+    else:
+        diagnostics["sector_source"] = "UNAVAILABLE_DEGRADED_TO_MARKET_CAP_STRATA"
+        snapshot["industry"] = ""
+
+    # MDCSTAT01501 is itself the official stock-market membership snapshot.
+    # Preferred shares/SPACs remain visible and are conservatively screened by name.
+    snapshot["in_desc_common_company_list"] = True
+    snapshot["listing_date"] = pd.NaT
+    snapshot["median_trading_value_20d"] = pd.NA
+    snapshot["trading_value_obs_20d"] = 0
+    snapshot["liquidity_status"] = "PENDING_SELECTED_STOCK_OHLCV_20D"
+    snapshot["reference_date"] = pd.to_datetime(resolved_text, format="%Y%m%d")
+    snapshot["source"] = "KRX_DIRECT_MDCSTAT01501_03901_POINT_IN_TIME"
+    diagnostics["liquidity_policy"] = (
+        "DEFERRED_TO_SELECTED_STOCK_OHLCV; no current-day substitution"
+    )
+    diagnostics["snapshot_rows_raw"] = int(len(snapshot))
+    return snapshot.sort_values(["market", "ticker"]).reset_index(drop=True), diagnostics
+
+
+def build_krx_direct_universe(session, reference_date, config=UniverseConfig(), progress=None):
+    raw, diagnostics = fetch_krx_direct_universe_snapshot(
+        session,
+        reference_date,
+        markets=config.markets,
+        progress=progress,
+    )
+    if raw.empty:
+        return raw, raw, diagnostics
+    full = classify_common_stock_candidates(raw)
+    full = add_structural_strata(full, config)
+    ordered = deterministic_selection_order(full)
+    diagnostics["snapshot_rows"] = int(len(full))
+    diagnostics["eligible_common_candidates"] = int(full["eligible_common_candidate"].sum())
+    diagnostics["selection_order_rows"] = int(len(ordered))
+    diagnostics["selection_rule"] = (
+        "market(KOSPI/KOSDAQ)+same-date KRX industry broad sector+within-market cap tercile; "
+        "ticker-stable round-robin; no response outcomes"
+    )
+    return full, ordered, diagnostics
+
+
+def fetch_krx_direct_raw_with_active_session(session, code, start, end):
+    """Fetch one stock's non-adjusted OHLCV through the already-authenticated KRX session."""
+    ticker = str(code).zfill(6)
+    diagnostics = {
+        "code": ticker,
+        "requested_start": str(start),
+        "requested_end": str(end),
+        "path": "KRX_ACTIVE_SESSION_MDCSTAT01701",
+        "chunks": [],
+        "credentials_stored": False,
+        "future_outcomes_opened": False,
+    }
+    isin, isin_status, isin_error = _krx_find_isin(session, ticker)
+    diagnostics.update({
+        "isin": isin,
+        "isin_status": isin_status,
+        "isin_error": isin_error,
+    })
+    if not isin:
+        diagnostics["status"] = "ISIN_NOT_FOUND"
+        return pd.DataFrame(), diagnostics
+
+    pieces = []
+    current = pd.Timestamp(start).date()
+    final = pd.Timestamp(end).date()
+    while current <= final:
+        chunk_end = min(current + timedelta(days=699), final)
+        record = {
+            "start": str(current),
+            "end": str(chunk_end),
+            "rows": 0,
+            "status": "",
+            "error": "",
+        }
+        payload = {
+            "bld": "dbms/MDC/STAT/standard/MDCSTAT01701",
+            "isuCd": isin,
+            "strtDd": current.strftime("%Y%m%d"),
+            "endDd": chunk_end.strftime("%Y%m%d"),
+            "adjStkPrc": "1",
+        }
+        try:
+            response = session.post(
+                KRX_JSON_URL, data=payload, headers=_krx_headers(), timeout=30
+            )
+            response.raise_for_status()
+            data = response.json()
+            rows = _krx_response_rows(data, ("output", "block1", "OutBlock_1"))
+            record["rows"] = int(len(rows))
+            record["krx_error_code"] = str(data.get("_error_code", ""))
+            if not rows:
+                record["status"] = "RAW_EMPTY"
+            else:
+                raw = pd.DataFrame(rows)
+                required = {
+                    "TRD_DD": "date",
+                    "TDD_OPNPRC": "open",
+                    "TDD_HGPRC": "high",
+                    "TDD_LWPRC": "low",
+                    "TDD_CLSPRC": "close",
+                    "ACC_TRDVOL": "volume",
+                }
+                optional = {
+                    "ACC_TRDVAL": "trading_value",
+                    "MKTCAP": "market_cap",
+                    "LIST_SHRS": "listed_shares",
+                    "FLUC_TP_CD": "fluc_type_code",
+                    "CMPPREVDD_PRC": "change_price",
+                    "FLUC_RT": "change_rate_pct",
+                }
+                missing = [column for column in required if column not in raw.columns]
+                if missing:
+                    record["status"] = "SCHEMA_ERROR"
+                    record["error"] = f"missing={missing}; columns={raw.columns.tolist()[:40]}"
+                else:
+                    keep = list(required) + [column for column in optional if column in raw.columns]
+                    rename = dict(required)
+                    rename.update({column: optional[column] for column in optional if column in raw.columns})
+                    normalized = raw[keep].rename(columns=rename)
+                    normalized["date"] = pd.to_datetime(
+                        normalized["date"], format="%Y/%m/%d", errors="coerce"
+                    )
+                    for column in [
+                        "open", "high", "low", "close", "volume", "trading_value",
+                        "market_cap", "listed_shares", "fluc_type_code", "change_price",
+                        "change_rate_pct",
+                    ]:
+                        if column in normalized.columns:
+                            normalized[column] = normalized[column].map(_clean_krx_num)
+                    pieces.append(normalized)
+                    record["status"] = "RAW_OK"
+        except Exception as ex:
+            record["status"] = "REQUEST_ERROR"
+            record["error"] = f"{type(ex).__name__}: {ex}"
+        diagnostics["chunks"].append(record)
+        current = chunk_end + timedelta(days=1)
+        time.sleep(0.20)
+
+    if not pieces:
+        diagnostics["status"] = "OHLCV_EMPTY"
+        return pd.DataFrame(), diagnostics
+
+    out = (
+        pd.concat(pieces, ignore_index=True)
+        .dropna(subset=["date", "open", "high", "low", "close", "volume"])
+        .sort_values("date")
+        .drop_duplicates("date", keep="last")
+        .reset_index(drop=True)
+    )
+    integer_columns = [
+        "open", "high", "low", "close", "volume", "trading_value",
+        "market_cap", "listed_shares", "fluc_type_code", "change_price",
+    ]
+    for column in integer_columns:
+        if column in out.columns:
+            out[column] = pd.to_numeric(out[column], errors="coerce").astype("Int64")
+    if "change_rate_pct" in out.columns:
+        out["change_rate_pct"] = pd.to_numeric(
+            out["change_rate_pct"], errors="coerce"
+        ).astype("Float64")
+    out["source"] = "KRX_DIRECT_RAW_ACTIVE_SESSION"
+    out["auto_corrected"] = False
+    diagnostics["status"] = "OHLCV_OK"
+    return out, diagnostics
 
 
 def fetch_krx_direct_raw(code, start, end, login_id="", login_pw=""):
@@ -748,7 +1134,7 @@ def make_batch_bundle(order_slice, start_date, end_date, login_id="", login_pw="
     files[f"{filename_time_prefix()}_batch_manifest.csv"] = manifest_bytes
 
     audit_obj = {
-        "app_build": "APP_v1.0.17",
+        "app_build": "APP_v1.0.18",
         "engine_build": "UNIVERSE_ENGINE_v0.1.14",
         "batch_start_order": int(order_slice["development_selection_order"].min()),
         "batch_end_order": int(order_slice["development_selection_order"].max()),
@@ -1699,6 +2085,28 @@ def _flow_batch_sorted_order(order_slice):
     return out.reset_index(drop=True)
 
 
+def encode_universe_artifacts(universe_full, universe_order, universe_audit):
+    """Return auditable Universe inputs for inclusion in the final combined ZIP."""
+    full = universe_full.copy()
+    order = universe_order.copy()
+    for frame in (full, order):
+        if "reference_date" in frame.columns:
+            frame["reference_date"] = pd.to_datetime(
+                frame["reference_date"], errors="coerce"
+            ).dt.strftime("%Y-%m-%d")
+    return {
+        "universe/universe_snapshot.csv": full.to_csv(
+            index=False, encoding="utf-8-sig"
+        ).encode("utf-8-sig"),
+        "universe/development_selection_order.csv": order.to_csv(
+            index=False, encoding="utf-8-sig"
+        ).encode("utf-8-sig"),
+        "universe/universe_audit.json": json.dumps(
+            universe_audit or {}, ensure_ascii=False, indent=2, default=str
+        ).encode("utf-8"),
+    }
+
+
 def flow_batch_job_id(order_slice, start_date, end_date):
     ordered = _flow_batch_sorted_order(order_slice)
     identity = {
@@ -1812,6 +2220,9 @@ def build_development_flow_batch_with_active_session(
     flow_sleep_seconds=0.25,
     stock_cooldown_seconds=2.0,
     reauthenticate=None,
+    universe_full=None,
+    universe_order=None,
+    universe_audit=None,
 ):
     ordered = _flow_batch_sorted_order(order_slice)
     job_id = flow_batch_job_id(ordered, start_date, end_date)
@@ -1978,6 +2389,10 @@ def build_development_flow_batch_with_active_session(
 
     manifest_df = pd.DataFrame(manifest_rows).sort_values("development_selection_order").reset_index(drop=True)
     files = {}
+    if universe_full is not None and universe_order is not None:
+        files.update(
+            encode_universe_artifacts(universe_full, universe_order, universe_audit)
+        )
     for _, rec in manifest_df.loc[manifest_df["status"] == "OK"].iterrows():
         checkpoint = load_flow_batch_checkpoint(
             job_dir,
@@ -1995,7 +2410,7 @@ def build_development_flow_batch_with_active_session(
     manifest_bytes = manifest_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
     files["batch_manifest.csv"] = manifest_bytes
     audit_obj = {
-        "app_build": "APP_v1.0.17",
+        "app_build": "APP_v1.0.18",
         "flow_batch_engine": FLOW_BATCH_ENGINE_VERSION,
         "flow_engine": FLOW_ENGINE_VERSION,
         "job_id": job_id,
@@ -2009,6 +2424,15 @@ def build_development_flow_batch_with_active_session(
         "zero_fill_used": False,
         "hrf_core_modified": False,
         "future_outcomes_opened": False,
+        "universe_integrated": bool(
+            universe_full is not None and universe_order is not None
+        ),
+        "universe_engine": (universe_audit or {}).get("engine_build", ""),
+        "universe_reference_business_day": (universe_audit or {}).get(
+            "resolved_reference_business_day", ""
+        ),
+        "universe_snapshot_rows": int(len(universe_full)) if universe_full is not None else 0,
+        "universe_selection_rows": int(len(universe_order)) if universe_order is not None else 0,
         "stocks": stock_audits,
     }
     audit_bytes = json.dumps(audit_obj, ensure_ascii=False, indent=2, default=str).encode("utf-8")
@@ -2067,6 +2491,14 @@ def make_development_flow_batch_bundle(
             except Exception:
                 return False
 
+        def active_session_ohlcv_fetcher(ticker, fetch_start, fetch_end):
+            if hasattr(auth_session, "is_valid") and not auth_session.is_valid():
+                if not reauthenticate():
+                    return pd.DataFrame(), {"status": "KRX_SESSION_REFRESH_FAILED"}
+            return fetch_krx_direct_raw_with_active_session(
+                auth_session, ticker, fetch_start, fetch_end
+            )
+
         return build_development_flow_batch_with_active_session(
             order_slice,
             start_date,
@@ -2075,11 +2507,135 @@ def make_development_flow_batch_bundle(
             pykrx_version=pykrx_version,
             progress=progress,
             checkpoint_root=checkpoint_root,
-            ohlcv_fetcher=ohlcv_fetcher,
+            ohlcv_fetcher=ohlcv_fetcher or active_session_ohlcv_fetcher,
             flow_max_days=flow_max_days,
             flow_sleep_seconds=flow_sleep_seconds,
             stock_cooldown_seconds=stock_cooldown_seconds,
             reauthenticate=reauthenticate,
+        )
+    finally:
+        try:
+            set_auth_session(None)
+        except Exception:
+            pass
+        try:
+            if auth_session is not None:
+                auth_session.session.close()
+        except Exception:
+            pass
+        FLOW_AUTH_LOCK.release()
+
+
+def make_integrated_universe_flow_batch_bundle(
+    reference_date,
+    target_count,
+    start_date,
+    end_date,
+    login_id,
+    login_pw,
+    progress=None,
+    checkpoint_root=None,
+    ohlcv_fetcher=None,
+    flow_max_days=365,
+    flow_sleep_seconds=0.25,
+    stock_cooldown_seconds=2.0,
+):
+    """Create the point-in-time Universe and collect the first N stocks in one login."""
+    if not (login_id and login_pw):
+        raise ValueError("KRX_ID_AND_PASSWORD_REQUIRED")
+    target_count = int(target_count)
+    if target_count < 1 or target_count > FLOW_BATCH_TARGET_COUNT:
+        raise ValueError(f"수집 종목수는 1~{FLOW_BATCH_TARGET_COUNT} 범위여야 합니다.")
+    try:
+        import pykrx
+        from pykrx import stock
+        from pykrx.website.comm.auth import KRXSession, set_auth_session
+    except Exception as ex:
+        raise RuntimeError("pykrx를 불러오지 못했습니다. requirements.txt를 확인하세요.") from ex
+
+    pykrx_version = getattr(pykrx, "__version__", "unknown")
+    auth_session = None
+    FLOW_AUTH_LOCK.acquire()
+    try:
+        if progress:
+            progress(0.0, "1/2 · KRX 로그인 중")
+        auth_session = KRXSession()
+        if not auth_session.refresh(login_id, login_pw):
+            raise PermissionError("KRX_LOGIN_REJECTED")
+        set_auth_session(auth_session)
+
+        if progress:
+            progress(0.01, "1/2 · Point-in-Time Universe 생성 중")
+
+        def universe_progress(_, message):
+            if progress:
+                progress(0.02, f"1/2 · {message}")
+
+        universe_full, universe_order, universe_audit = build_krx_direct_universe(
+            auth_session,
+            reference_date,
+            UniverseConfig(),
+            progress=universe_progress,
+        )
+        if universe_full.empty or universe_order.empty:
+            reason = universe_audit.get("snapshot_failure", "usable selection order 없음")
+            raise RuntimeError(f"UNIVERSE_GENERATION_FAILED: {reason}")
+        if len(universe_order) < target_count:
+            raise RuntimeError(
+                f"UNIVERSE_TOO_SMALL: selection order {len(universe_order)} < requested {target_count}"
+            )
+        selection = _flow_batch_sorted_order(universe_order).head(target_count).copy()
+        if progress:
+            progress(
+                0.04,
+                f"1/2 · Universe 완료 {len(universe_full):,}종목 · 수집대상 {len(selection)}종목",
+            )
+
+        def reauthenticate():
+            try:
+                ok = bool(auth_session.refresh(login_id, login_pw))
+                if ok:
+                    set_auth_session(auth_session)
+                return ok
+            except Exception:
+                return False
+
+        def active_session_ohlcv_fetcher(ticker, fetch_start, fetch_end):
+            if hasattr(auth_session, "is_valid") and not auth_session.is_valid():
+                if not reauthenticate():
+                    return pd.DataFrame(), {"status": "KRX_SESSION_REFRESH_FAILED"}
+            return fetch_krx_direct_raw_with_active_session(
+                auth_session, ticker, fetch_start, fetch_end
+            )
+
+        def batch_progress(value, message):
+            if progress:
+                progress(0.04 + 0.96 * min(max(float(value), 0.0), 1.0), f"2/2 · {message}")
+
+        payload, manifest, batch_audit = build_development_flow_batch_with_active_session(
+            selection,
+            start_date,
+            end_date,
+            stock,
+            pykrx_version=pykrx_version,
+            progress=batch_progress,
+            checkpoint_root=checkpoint_root,
+            ohlcv_fetcher=ohlcv_fetcher or active_session_ohlcv_fetcher,
+            flow_max_days=flow_max_days,
+            flow_sleep_seconds=flow_sleep_seconds,
+            stock_cooldown_seconds=stock_cooldown_seconds,
+            reauthenticate=reauthenticate,
+            universe_full=universe_full,
+            universe_order=universe_order,
+            universe_audit=universe_audit,
+        )
+        return (
+            payload,
+            manifest,
+            batch_audit,
+            universe_full,
+            universe_order,
+            universe_audit,
         )
     finally:
         try:
@@ -2099,15 +2655,15 @@ def fetch_flow_cached(ticker, start, end):
     return fetch_investor_flow_by_date(ticker, start, end)
 
 
-st.title("Korea OHLCV CSV v1.0.17 STOCK + FLOW BATCH 99 + INDEX + UNIVERSE")
+st.title("Korea OHLCV CSV v1.0.18 UNIVERSE + OHLCV + FLOW 99")
 st.caption(
     "개별주식 KRX DIRECT RAW + KOSPI/KOSDAQ 지수(FDR) + "
-    "Track 02 Development Universe · 원본 보존 · outcome-blind"
+    "Track 02 Development Universe · 99종목 일괄 수집 · 원본 보존 · outcome-blind"
 )
 
 st.caption(
-    "BUILD: APP_v1.0.17 / UNIVERSE_ENGINE_v0.1.14 / "
-    "BATCH_OHLCV_v0.6 / INVESTOR_FLOW_INPUT_v0.3.0 / FLOW_BATCH_v0.1.0"
+    "BUILD: APP_v1.0.18 / UNIVERSE_DIRECT_v0.1.0 / "
+    "BATCH_OHLCV_v0.6 / INVESTOR_FLOW_INPUT_v0.3.0 / FLOW_BATCH_v0.2.0"
 )
 
 data_kind = st.radio(
@@ -2117,7 +2673,7 @@ data_kind = st.radio(
         "시장지수",
         "Development Universe",
         "Development Batch OHLCV",
-        "Development Batch OHLCV + FLOW (99)",
+        "Development Universe + OHLCV + FLOW (99)",
     ],
     horizontal=True,
 )
@@ -2603,32 +3159,35 @@ elif data_kind == "Development Batch OHLCV":
                 )
 
 # ---------------------------------------------------------------------
-# DEVELOPMENT BATCH OHLCV + INVESTOR FLOW — one-click, sequential, resumable
+# DEVELOPMENT UNIVERSE + OHLCV + INVESTOR FLOW — one-click, sequential, resumable
 # ---------------------------------------------------------------------
-elif data_kind == "Development Batch OHLCV + FLOW (99)":
+elif data_kind == "Development Universe + OHLCV + FLOW (99)":
     st.success(
-        "승인된 Development selection order의 앞 99종목을 한 번 실행으로 순차 수집합니다. "
-        "각 종목은 OHLCV·기관/외국인 수급·날짜 일치·보존식을 통과해야 완료로 저장됩니다."
+        "Universe 생성과 앞 99종목 OHLCV·기관/외국인 수급 수집을 한 번에 실행합니다. "
+        "중간 Universe ZIP 다운로드·재업로드 단계는 없습니다."
     )
     st.warning(
         "99종목은 KRX 요청량이 많아 수 시간이 걸릴 수 있습니다. 병렬 폭주는 사용하지 않습니다. "
-        "연결이 끊기면 같은 Universe ZIP·날짜·종목수로 다시 실행하세요. 같은 실행 서버에 남은 "
+        "연결이 끊기면 같은 기준일·수집기간·종목수로 다시 실행하세요. 같은 실행 서버에 남은 "
         "완료 체크포인트는 건너뛰지만 앱 재배포·서버 재시작 시 체크포인트가 사라질 수 있습니다."
     )
     st.info(
-        "이 기능은 원자료 수집 전용입니다. 99종목을 모두 수집해도 연구 규칙은 DEV에서 먼저 고정하고 "
-        "REP/OOS를 나중에 개봉합니다. HRF CORE·S1·NEXT는 변경하지 않습니다."
+        "기준일 스냅샷은 로그인된 KRX의 MDCSTAT01501·03901을 직접 사용합니다. "
+        "pykrx의 '종가/시가총액' 열 오류를 우회하되, 현재 종목표를 과거 기준일에 섞지 않습니다. "
+        "HRF CORE·S1·NEXT는 변경하지 않습니다."
     )
 
-    flow_batch_universe = st.file_uploader(
-        "승인된 Universe Audit Bundle ZIP",
-        type=["zip"],
-        accept_multiple_files=False,
-        key="flow_batch_universe_zip",
-    )
-
-    fb1, fb2 = st.columns(2)
+    fb1, fb2, fb3 = st.columns(3)
     with fb1:
+        integrated_universe_ref = st.date_input(
+            "Universe 기준일",
+            value=latest_finalized_flow_date(),
+            min_value=date(2000, 1, 1),
+            max_value=date.today(),
+            key="integrated_universe_ref",
+            help="휴장일이면 이 날짜 이전의 가장 가까운 KRX 거래일로 자동 확정합니다.",
+        )
+    with fb2:
         flow_batch_count = st.number_input(
             "수집 종목수",
             min_value=1,
@@ -2637,7 +3196,7 @@ elif data_kind == "Development Batch OHLCV + FLOW (99)":
             step=1,
             help="기본값 99. 운영 점검 때만 줄이고 본 수집은 99로 실행합니다.",
         )
-    with fb2:
+    with fb3:
         st.metric("최종 확정 수급 가능일", str(latest_finalized_flow_date()))
 
     fbd1, fbd2 = st.columns(2)
@@ -2658,136 +3217,140 @@ elif data_kind == "Development Batch OHLCV + FLOW (99)":
             key="flow_batch_end",
         )
 
-    if flow_batch_universe is not None:
-        try:
-            flow_order, flow_universe_audit = parse_universe_bundle(flow_batch_universe)
-        except Exception as ex:
-            st.error(f"Universe ZIP 해석 실패: {type(ex).__name__}: {ex}")
-            st.stop()
+    target_count = int(flow_batch_count)
+    with st.form("integrated_universe_flow_batch_form", clear_on_submit=False):
+        st.caption(
+            "KRX 로그인은 Universe 생성부터 수급 수집까지 한 실행에서 사용합니다. "
+            "ID/PW 값은 CSV·ZIP·audit·체크포인트에 저장하지 않습니다."
+        )
+        flow_batch_krx_id = st.text_input(
+            "KRX ID", value="", key="integrated_flow_batch_krx_id_form"
+        )
+        flow_batch_krx_pw = st.text_input(
+            "KRX 비밀번호", value="", type="password", key="integrated_flow_batch_krx_pw_form"
+        )
+        run_flow_batch = st.form_submit_button(
+            f"Universe 생성 + {target_count}종목 OHLCV·FLOW 일괄 만들기",
+            type="primary",
+            use_container_width=True,
+        )
 
-        target_count = int(flow_batch_count)
-        if len(flow_order) < target_count:
+    if run_flow_batch:
+        if flow_batch_start > flow_batch_end:
+            st.error("결합 시작일/종료일을 확인하세요.")
+            st.stop()
+        if flow_batch_end > latest_finalized_flow_date():
             st.error(
-                f"Universe selection order가 {len(flow_order):,}종목뿐이라 "
-                f"요청한 {target_count}종목을 만들 수 없습니다."
+                f"수급 확정 전 날짜가 포함됐습니다. 종료일을 "
+                f"{latest_finalized_flow_date()} 이하로 설정하세요."
             )
             st.stop()
+        if not flow_batch_krx_id or not flow_batch_krx_pw:
+            st.error("KRX ID와 비밀번호를 모두 입력한 뒤 같은 폼의 실행 버튼을 눌러주세요.")
+            st.stop()
+
+        st.success("KRX ID/PW 입력 감지: YES / YES · 값은 저장하지 않습니다.")
+        flow_progress = st.progress(0, text="Universe + 99종목 수집 준비 중")
+
+        def flow_batch_progress(value, message):
+            flow_progress.progress(min(max(float(value), 0.0), 1.0), text=message)
+
+        try:
+            (
+                flow_payload,
+                flow_manifest,
+                flow_batch_audit,
+                flow_universe_full,
+                flow_order,
+                flow_universe_audit,
+            ) = make_integrated_universe_flow_batch_bundle(
+                integrated_universe_ref,
+                target_count,
+                flow_batch_start,
+                flow_batch_end,
+                login_id=flow_batch_krx_id,
+                login_pw=flow_batch_krx_pw,
+                progress=flow_batch_progress,
+            )
+        except PermissionError:
+            flow_progress.empty()
+            st.error("KRX 로그인이 거부됐습니다. ID·비밀번호 또는 비밀번호 변경 필요 여부를 확인하세요.")
+            st.stop()
+        except Exception as ex:
+            flow_progress.empty()
+            st.error(f"Universe + 99종목 결합 실패: {type(ex).__name__}: {ex}")
+            st.caption("같은 기준일·수집기간·종목수로 다시 실행하면 완료 체크포인트부터 재개합니다.")
+            st.stop()
+        flow_progress.empty()
 
         flow_slice = _flow_batch_sorted_order(flow_order).head(target_count).copy()
         flow_job_id = flow_batch_job_id(flow_slice, flow_batch_start, flow_batch_end)
         st.write(
-            f"Universe engine: **{flow_universe_audit.get('engine_build', 'UNKNOWN')}** · "
-            f"수집 대상: **{len(flow_slice)}종목** · "
-            f"selection order: **{int(flow_slice.development_selection_order.min())}~"
-            f"{int(flow_slice.development_selection_order.max())}** · job: **{flow_job_id}**"
+            f"Universe 기준 영업일: **{flow_universe_audit.get('resolved_reference_business_day', 'UNKNOWN')}** · "
+            f"snapshot: **{len(flow_universe_full):,}종목** · "
+            f"selection order: **{len(flow_order):,}종목** · 수집 대상: **{len(flow_slice)}종목** · "
+            f"job: **{flow_job_id}**"
         )
+        if flow_universe_audit.get("errors"):
+            with st.expander("Universe 보조 분류 오류 로그"):
+                st.dataframe(
+                    pd.DataFrame(flow_universe_audit["errors"]),
+                    use_container_width=True,
+                    hide_index=True,
+                )
         show_columns = [column for column in [
             "development_selection_order", "ticker", "name", "market",
             "selection_sector", "market_cap_bucket", "selection_stratum",
         ] if column in flow_slice.columns]
         st.dataframe(flow_slice[show_columns], use_container_width=True, hide_index=True)
 
-        with st.form("development_flow_batch_run_form", clear_on_submit=False):
-            st.caption(
-                "KRX 로그인은 배치 시작 시 한 번 열고, 세션 오류 때만 재인증합니다. "
-                "ID/PW 값은 CSV·ZIP·audit·체크포인트에 저장하지 않습니다."
+        flow_ok_count = int((flow_manifest["status"] == "OK").sum())
+        flow_reused_count = int(flow_manifest["checkpoint_reused"].sum())
+        if flow_ok_count == len(flow_manifest):
+            st.success(
+                f"Universe + {len(flow_manifest)}종목 결합 완료 · "
+                f"성공 {flow_ok_count}/{len(flow_manifest)} · 체크포인트 재사용 {flow_reused_count}"
             )
-            flow_batch_krx_id = st.text_input(
-                "KRX ID", value="", key="flow_batch_krx_id_form"
-            )
-            flow_batch_krx_pw = st.text_input(
-                "KRX 비밀번호", value="", type="password", key="flow_batch_krx_pw_form"
-            )
-            run_flow_batch = st.form_submit_button(
-                f"Development {target_count}종목 OHLCV + FLOW 일괄 만들기",
-                type="primary",
-                use_container_width=True,
+        else:
+            st.warning(
+                f"부분 완료 · 성공 {flow_ok_count}/{len(flow_manifest)} · "
+                f"체크포인트 재사용 {flow_reused_count}. 실패 종목은 0으로 채우지 않았습니다. "
+                "같은 설정으로 다시 실행하세요."
             )
 
-        if run_flow_batch:
-            if flow_batch_start > flow_batch_end:
-                st.error("결합 시작일/종료일을 확인하세요.")
-                st.stop()
-            if flow_batch_end > latest_finalized_flow_date():
-                st.error(
-                    f"수급 확정 전 날짜가 포함됐습니다. 종료일을 "
-                    f"{latest_finalized_flow_date()} 이하로 설정하세요."
-                )
-                st.stop()
-            if not flow_batch_krx_id or not flow_batch_krx_pw:
-                st.error("KRX ID와 비밀번호를 모두 입력한 뒤 같은 폼의 실행 버튼을 눌러주세요.")
-                st.stop()
+        manifest_view_columns = [column for column in [
+            "development_selection_order", "ticker", "name", "status", "rows",
+            "actual_start", "actual_end", "flow_status", "merge_status",
+            "conservation_status", "checkpoint_reused", "elapsed_seconds", "error",
+        ] if column in flow_manifest.columns]
+        st.dataframe(
+            flow_manifest[manifest_view_columns],
+            use_container_width=True,
+            hide_index=True,
+        )
 
-            st.success("KRX ID/PW 입력 감지: YES / YES · 값은 저장하지 않습니다.")
-            flow_progress = st.progress(0, text="99종목 수집 준비 중")
-
-            def flow_batch_progress(value, message):
-                flow_progress.progress(min(max(float(value), 0.0), 1.0), text=message)
-
-            try:
-                flow_payload, flow_manifest, flow_batch_audit = make_development_flow_batch_bundle(
-                    flow_slice,
-                    flow_batch_start,
-                    flow_batch_end,
-                    login_id=flow_batch_krx_id,
-                    login_pw=flow_batch_krx_pw,
-                    progress=flow_batch_progress,
-                )
-            except PermissionError:
-                flow_progress.empty()
-                st.error("KRX 로그인이 거부됐습니다. ID·비밀번호 또는 비밀번호 변경 필요 여부를 확인하세요.")
-                st.stop()
-            except Exception as ex:
-                flow_progress.empty()
-                st.error(f"99종목 결합 배치 실패: {type(ex).__name__}: {ex}")
-                st.caption("같은 ZIP·날짜·종목수로 다시 실행하면 완료 체크포인트부터 재개합니다.")
-                st.stop()
-            flow_progress.empty()
-
-            flow_ok_count = int((flow_manifest["status"] == "OK").sum())
-            flow_reused_count = int(flow_manifest["checkpoint_reused"].sum())
-            if flow_ok_count == len(flow_manifest):
-                st.success(
-                    f"99종목 결합 완료 · 성공 {flow_ok_count}/{len(flow_manifest)} · "
-                    f"체크포인트 재사용 {flow_reused_count}"
-                )
-            else:
-                st.warning(
-                    f"부분 완료 · 성공 {flow_ok_count}/{len(flow_manifest)} · "
-                    f"체크포인트 재사용 {flow_reused_count}. 실패 종목은 0으로 채우지 않았습니다. "
-                    "같은 설정으로 다시 실행하세요."
-                )
-
-            manifest_view_columns = [column for column in [
-                "development_selection_order", "ticker", "name", "status", "rows",
-                "actual_start", "actual_end", "flow_status", "merge_status",
-                "conservation_status", "checkpoint_reused", "elapsed_seconds", "error",
-            ] if column in flow_manifest.columns]
-            st.dataframe(
-                flow_manifest[manifest_view_columns],
-                use_container_width=True,
-                hide_index=True,
-            )
-
-            partial_suffix = "" if flow_ok_count == len(flow_manifest) else "_PARTIAL"
-            created = date.today().strftime("%Y%m%d")
-            flow_batch_name = (
-                f"DEV_FLOW_ORD{int(flow_slice.development_selection_order.min()):04d}-"
-                f"{int(flow_slice.development_selection_order.max()):04d}_"
-                f"{flow_batch_start:%Y%m%d}_{flow_batch_end:%Y%m%d}_"
-                f"생성{created}{partial_suffix}.zip"
-            )
-            st.download_button(
-                "99종목 OHLCV + 기관·외국인 수급 ZIP 다운로드",
-                flow_payload,
-                file_name=flow_batch_name,
-                mime="application/zip",
-                use_container_width=True,
-            )
-            st.caption(
-                "ZIP에는 성공 종목별 결합 CSV, batch_manifest.csv, batch_audit.json, "
-                "SHA256_MANIFEST.json이 들어 있습니다. 실패·결측은 0으로 대체하지 않습니다."
-            )
+        partial_suffix = "" if flow_ok_count == len(flow_manifest) else "_PARTIAL"
+        created = date.today().strftime("%Y%m%d")
+        resolved_ref = flow_universe_audit.get(
+            "resolved_reference_business_day", integrated_universe_ref.strftime("%Y%m%d")
+        )
+        flow_batch_name = (
+            f"DEV_UNIVERSE_FLOW_{target_count:03d}_REF{resolved_ref}_"
+            f"{flow_batch_start:%Y%m%d}_{flow_batch_end:%Y%m%d}_"
+            f"생성{created}{partial_suffix}.zip"
+        )
+        st.download_button(
+            "Universe + 99종목 OHLCV·기관·외국인 수급 ZIP 다운로드",
+            flow_payload,
+            file_name=flow_batch_name,
+            mime="application/zip",
+            use_container_width=True,
+        )
+        st.caption(
+            "ZIP에는 Universe snapshot/order/audit, 성공 종목별 결합 CSV, "
+            "batch_manifest.csv, batch_audit.json, SHA256_MANIFEST.json이 들어 있습니다. "
+            "실패·결측은 0으로 대체하지 않습니다."
+        )
 
 # ---------------------------------------------------------------------
 # STOCK / INDEX — existing v0.9.9 data paths preserved
