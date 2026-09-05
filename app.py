@@ -25,7 +25,7 @@ from universe_engine_v0_1_14 import (
     deterministic_selection_order,
 )
 
-st.set_page_config(page_title="Korea OHLCV CSV v1.0.20 UNIVERSE + FLOW 99", page_icon="📈")
+st.set_page_config(page_title="Korea OHLCV CSV v1.0.19 UNIVERSE + FLOW 99", page_icon="📈")
 
 H = {
     "User-Agent": "Mozilla/5.0",
@@ -67,7 +67,7 @@ FLOW_ENGINE_VERSION = "INVESTOR_FLOW_INPUT_v0.3.0_20260902"
 FLOW_BATCH_ENGINE_VERSION = "FLOW_BATCH_v0.2.0_20260902"
 UNIVERSE_DIRECT_ENGINE_VERSION = "UNIVERSE_DIRECT_v0.1.0_20260902"
 FLOW_BATCH_TARGET_COUNT = 99
-FLOW_BATCH_CHECKPOINT_ROOT = Path(tempfile.gettempdir()) / "hrf_flow_batch_v1_0_20"
+FLOW_BATCH_CHECKPOINT_ROOT = Path(tempfile.gettempdir()) / "hrf_flow_batch_v1_0_19"
 UNIVERSE_MARKET_IDS = {"KOSPI": "STK", "KOSDAQ": "KSQ"}
 FLOW_SOURCE = "KRX_VIA_PYKRX_INVESTOR_BY_DATE"
 FLOW_INVESTOR_ALIASES = {
@@ -1134,7 +1134,7 @@ def make_batch_bundle(order_slice, start_date, end_date, login_id="", login_pw="
     files[f"{filename_time_prefix()}_batch_manifest.csv"] = manifest_bytes
 
     audit_obj = {
-        "app_build": "APP_v1.0.20",
+        "app_build": "APP_v1.0.19",
         "engine_build": "UNIVERSE_ENGINE_v0.1.14",
         "batch_start_order": int(order_slice["development_selection_order"].min()),
         "batch_end_order": int(order_slice["development_selection_order"].max()),
@@ -2435,7 +2435,7 @@ def build_development_flow_batch_with_active_session(
     manifest_bytes = manifest_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
     files["batch_manifest.csv"] = manifest_bytes
     audit_obj = {
-        "app_build": "APP_v1.0.20",
+        "app_build": "APP_v1.0.19",
         "flow_batch_engine": FLOW_BATCH_ENGINE_VERSION,
         "flow_engine": FLOW_ENGINE_VERSION,
         "job_id": job_id,
@@ -2601,39 +2601,10 @@ def make_integrated_universe_flow_batch_bundle(
     try:
         if progress:
             progress(0.0, "1/2 · KRX 로그인 중")
-        # Initial KRX login can fail transiently when the server returns a
-        # non-JSON/HTML response even with valid credentials.  v1.0.20 retries
-        # with a fresh KRXSession so a single JSONDecodeError does not abort the
-        # whole integrated job.  Credentials are never written to diagnostics.
-        login_errors = []
-        auth_session = None
-        for login_attempt in range(1, 4):
-            candidate = KRXSession()
-            try:
-                login_ok = bool(candidate.refresh(login_id, login_pw))
-                if login_ok:
-                    auth_session = candidate
-                    set_auth_session(auth_session)
-                    break
-                login_errors.append(f"attempt={login_attempt}: KRX_LOGIN_REJECTED")
-            except Exception as ex:
-                login_errors.append(
-                    f"attempt={login_attempt}: {type(ex).__name__}: {ex}"
-                )
-            try:
-                candidate.session.close()
-            except Exception:
-                pass
-            if login_attempt < 3:
-                time.sleep(float(login_attempt))
-
-        if auth_session is None:
-            if login_errors and all("KRX_LOGIN_REJECTED" in item for item in login_errors):
-                raise PermissionError("KRX_LOGIN_REJECTED")
-            last_error = login_errors[-1] if login_errors else "unknown login response error"
-            raise RuntimeError(
-                "KRX_LOGIN_RESPONSE_ERROR_AFTER_3_ATTEMPTS: " + last_error
-            )
+        auth_session = KRXSession()
+        if not auth_session.refresh(login_id, login_pw):
+            raise PermissionError("KRX_LOGIN_REJECTED")
+        set_auth_session(auth_session)
 
         if progress:
             progress(0.01, "1/2 · Point-in-Time Universe 생성 중")
@@ -2663,43 +2634,13 @@ def make_integrated_universe_flow_batch_bundle(
             )
 
         def reauthenticate():
-            nonlocal auth_session
-
-            # First try to refresh the currently active object.
             try:
                 ok = bool(auth_session.refresh(login_id, login_pw))
                 if ok:
                     set_auth_session(auth_session)
-                    return True
+                return ok
             except Exception:
-                pass
-
-            # If the current session object itself is poisoned/stale, rebuild it.
-            # This specifically covers the live case where is_valid()==True but
-            # KRX starts returning non-JSON and refresh() raises JSONDecodeError.
-            old_session = auth_session
-            for rebuild_attempt in range(1, 3):
-                candidate = KRXSession()
-                try:
-                    ok = bool(candidate.refresh(login_id, login_pw))
-                    if ok:
-                        auth_session = candidate
-                        set_auth_session(auth_session)
-                        try:
-                            if old_session is not None:
-                                old_session.session.close()
-                        except Exception:
-                            pass
-                        return True
-                except Exception:
-                    pass
-                try:
-                    candidate.session.close()
-                except Exception:
-                    pass
-                if rebuild_attempt < 2:
-                    time.sleep(float(rebuild_attempt))
-            return False
+                return False
 
         def active_session_ohlcv_fetcher(ticker, fetch_start, fetch_end):
             if hasattr(auth_session, "is_valid") and not auth_session.is_valid():
@@ -2773,14 +2714,14 @@ def fetch_flow_cached(ticker, start, end):
     return fetch_investor_flow_by_date(ticker, start, end)
 
 
-st.title("Korea OHLCV CSV v1.0.20 UNIVERSE + OHLCV + FLOW 99")
+st.title("Korea OHLCV CSV v1.0.19 UNIVERSE + OHLCV + FLOW 99")
 st.caption(
     "개별주식 KRX DIRECT RAW + KOSPI/KOSDAQ 지수(FDR) + "
     "Track 02 Development Universe · 99종목 일괄 수집 · 원본 보존 · outcome-blind"
 )
 
 st.caption(
-    "BUILD: APP_v1.0.20 / UNIVERSE_DIRECT_v0.1.0 / "
+    "BUILD: APP_v1.0.19 / UNIVERSE_DIRECT_v0.1.0 / "
     "BATCH_OHLCV_v0.6 / INVESTOR_FLOW_INPUT_v0.3.0 / FLOW_BATCH_v0.2.0"
 )
 
