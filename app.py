@@ -25,7 +25,7 @@ from universe_engine_v0_1_14 import (
     deterministic_selection_order,
 )
 
-st.set_page_config(page_title="Korea OHLCV CSV v1.0.19 UNIVERSE + FLOW 99", page_icon="📈")
+st.set_page_config(page_title="Korea OHLCV CSV v1.0.21 UNIVERSE + FLOW 99", page_icon="📈")
 
 H = {
     "User-Agent": "Mozilla/5.0",
@@ -67,7 +67,7 @@ FLOW_ENGINE_VERSION = "INVESTOR_FLOW_INPUT_v0.3.0_20260902"
 FLOW_BATCH_ENGINE_VERSION = "FLOW_BATCH_v0.2.0_20260902"
 UNIVERSE_DIRECT_ENGINE_VERSION = "UNIVERSE_DIRECT_v0.1.0_20260902"
 FLOW_BATCH_TARGET_COUNT = 99
-FLOW_BATCH_CHECKPOINT_ROOT = Path(tempfile.gettempdir()) / "hrf_flow_batch_v1_0_19"
+FLOW_BATCH_CHECKPOINT_ROOT = Path(tempfile.gettempdir()) / "hrf_flow_batch_v1_0_21"
 UNIVERSE_MARKET_IDS = {"KOSPI": "STK", "KOSDAQ": "KSQ"}
 FLOW_SOURCE = "KRX_VIA_PYKRX_INVESTOR_BY_DATE"
 FLOW_INVESTOR_ALIASES = {
@@ -81,6 +81,13 @@ FLOW_METRICS = ("qty", "value")
 FLOW_CORE_INVESTORS = ("institution", "foreign")
 FLOW_ALL_INVESTORS = ("institution", "foreign", "individual", "other_corporation")
 FLOW_AUTH_LOCK = threading.Lock()
+
+# v1.0.21 live-stability controls. These do not change HRF CORE/S1/NEXT.
+# The 2026-09-04 DEV99 live run showed a persistent non-JSON KRX response
+# after 13 successful stocks. Immediate re-login alone did not recover it.
+KRX_RESPONSE_BACKOFF_SECONDS = (20.0, 60.0, 120.0)
+KRX_BATCH_REST_EVERY = 10
+KRX_BATCH_REST_SECONDS = 60.0
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -1134,7 +1141,7 @@ def make_batch_bundle(order_slice, start_date, end_date, login_id="", login_pw="
     files[f"{filename_time_prefix()}_batch_manifest.csv"] = manifest_bytes
 
     audit_obj = {
-        "app_build": "APP_v1.0.19",
+        "app_build": "APP_v1.0.21",
         "engine_build": "UNIVERSE_ENGINE_v0.1.14",
         "batch_start_order": int(order_slice["development_selection_order"].min()),
         "batch_end_order": int(order_slice["development_selection_order"].max()),
@@ -2197,6 +2204,33 @@ def save_flow_batch_checkpoint(job_dir, metadata, payload):
     return meta
 
 
+def _diagnostics_has_krx_response_error(diagnostics):
+    if not isinstance(diagnostics, dict):
+        return False
+    text = str(diagnostics.get("isin_error", ""))
+    if any(token in text for token in ("JSONDecodeError", "Expecting value", "RequestException", "ConnectionError", "Timeout")):
+        return True
+    for record in diagnostics.get("chunks", []) or []:
+        if str(record.get("status", "")) == "REQUEST_ERROR":
+            return True
+        error = str(record.get("error", ""))
+        if any(token in error for token in ("JSONDecodeError", "Expecting value", "RequestException", "ConnectionError", "Timeout")):
+            return True
+    return False
+
+
+def _flow_diagnostics_has_krx_response_error(diagnostics):
+    if not isinstance(diagnostics, dict):
+        return False
+    for record in diagnostics.get("calls", []) or []:
+        if str(record.get("status", "")) != "ERROR":
+            continue
+        error = str(record.get("error", ""))
+        if any(token in error for token in ("JSONDecodeError", "Expecting value", "RequestException", "ConnectionError", "Timeout")):
+            return True
+    return False
+
+
 def fetch_ohlcv_for_flow_batch(ticker, start_date, end_date, retries=2, retry_wait=8.0, fetcher=None):
     fetch = fetcher or fetch_krx_direct_raw
     attempts = []
@@ -2217,6 +2251,13 @@ def fetch_ohlcv_for_flow_batch(ticker, start_date, end_date, retries=2, retry_wa
             "diagnostics": diagnostics,
         })
         last = frame
+        if isinstance(diagnostics, dict) and diagnostics.get("circuit_open"):
+            return frame, {
+                "status": "KRX_CIRCUIT_OPEN",
+                "attempts": attempts,
+                "circuit_open": True,
+                "recovery_events": diagnostics.get("recovery_events", []),
+            }
         if not frame.empty:
             return frame, {"status": "OHLCV_OK", "attempts": attempts}
         if attempt < int(retries) and retry_wait > 0:
@@ -2237,6 +2278,9 @@ def build_development_flow_batch_with_active_session(
     flow_sleep_seconds=0.25,
     stock_cooldown_seconds=2.0,
     reauthenticate=None,
+    response_recovery=None,
+    batch_rest_every=10,
+    batch_rest_seconds=60.0,
     universe_full=None,
     universe_order=None,
     universe_audit=None,
@@ -2250,6 +2294,8 @@ def build_development_flow_batch_with_active_session(
     manifest_rows = []
     stock_audits = []
     total = len(ordered)
+    live_attempt_count = 0
+    circuit_breaker_triggered = False
     for batch_index, row in ordered.iterrows():
         started = time.time()
         position = int(row["development_selection_order"])
@@ -2320,7 +2366,15 @@ def build_development_flow_batch_with_active_session(
             )
             stock_audit["ohlcv"] = ohlcv_diagnostics
             if ohlcv.empty:
-                rec["status"] = "OHLCV_EMPTY"
+                if ohlcv_diagnostics.get("status") == "KRX_CIRCUIT_OPEN":
+                    rec["status"] = "KRX_CIRCUIT_OPEN"
+                    rec["error"] = (
+                        "persistent KRX non-JSON/response error after controlled backoff; "
+                        "remaining stocks were not attempted"
+                    )
+                    circuit_breaker_triggered = True
+                else:
+                    rec["status"] = "OHLCV_EMPTY"
             else:
                 ohlcv = add_audit_columns(ohlcv)
                 rec["valid_sessions"] = int(ohlcv["valid_session"].sum())
@@ -2328,7 +2382,7 @@ def build_development_flow_batch_with_active_session(
 
                 flow = pd.DataFrame()
                 flow_diagnostics = {}
-                for flow_attempt in range(1, 3):
+                for flow_attempt in range(1, 4):
                     flow, flow_diagnostics = fetch_investor_flow_from_active_session(
                         stock_api,
                         ticker,
@@ -2347,12 +2401,33 @@ def build_development_flow_batch_with_active_session(
                     if flow_attempt == 1 and callable(reauthenticate):
                         stock_audit["reauthentication_attempted"] = True
                         stock_audit["reauthentication_success"] = bool(reauthenticate())
-                    if flow_attempt == 1:
                         time.sleep(3.0 if flow_sleep_seconds > 0 else 0.0)
+                        continue
+                    if (
+                        flow_attempt == 2
+                        and _flow_diagnostics_has_krx_response_error(flow_diagnostics)
+                        and callable(response_recovery)
+                    ):
+                        stock_audit["response_recovery_attempted"] = True
+                        recovered, recovery_events = response_recovery(ticker)
+                        stock_audit["response_recovery_success"] = bool(recovered)
+                        stock_audit["response_recovery_events"] = recovery_events
+                        if recovered:
+                            continue
+                        rec["status"] = "KRX_CIRCUIT_OPEN"
+                        rec["error"] = (
+                            "persistent KRX response error during investor flow after controlled backoff; "
+                            "remaining stocks were not attempted"
+                        )
+                        circuit_breaker_triggered = True
+                        break
+                    break
 
                 raw_flow_status = flow_diagnostics.get("status", "")
                 rec["flow_status"] = raw_flow_status
-                if flow.empty:
+                if rec["status"] == "KRX_CIRCUIT_OPEN":
+                    pass
+                elif flow.empty:
                     rec["status"] = raw_flow_status or "FLOW_EMPTY"
                 elif not bool(flow["flow_finalized"].all()):
                     rec["status"] = "FLOW_NOT_FINALIZED"
@@ -2409,7 +2484,58 @@ def build_development_flow_batch_with_active_session(
         rec["elapsed_seconds"] = round(time.time() - started, 3)
         manifest_rows.append(rec)
         stock_audits.append(stock_audit)
-        if stock_cooldown_seconds > 0:
+        live_attempt_count += 1
+
+        if circuit_breaker_triggered:
+            for _, remaining_row in ordered.iloc[batch_index + 1 :].iterrows():
+                remaining_position = int(remaining_row["development_selection_order"])
+                remaining_ticker = str(remaining_row["ticker"]).zfill(6)
+                remaining_name = str(remaining_row.get("name", remaining_ticker))
+                manifest_rows.append({
+                    "development_selection_order": remaining_position,
+                    "ticker": remaining_ticker,
+                    "name": remaining_name,
+                    "market": remaining_row.get("market", ""),
+                    "selection_sector": remaining_row.get("selection_sector", ""),
+                    "selection_stratum": remaining_row.get("selection_stratum", ""),
+                    "status": "NOT_ATTEMPTED_CIRCUIT_OPEN",
+                    "rows": 0,
+                    "actual_start": "",
+                    "actual_end": "",
+                    "valid_sessions": 0,
+                    "ohlc_warning_rows": 0,
+                    "flow_status": "",
+                    "merge_status": "",
+                    "conservation_status": "",
+                    "checkpoint_reused": False,
+                    "elapsed_seconds": 0.0,
+                    "sha256": "",
+                    "file": "",
+                    "error": "not attempted because KRX circuit breaker opened",
+                })
+                stock_audits.append({
+                    "development_selection_order": remaining_position,
+                    "ticker": remaining_ticker,
+                    "name": remaining_name,
+                    "checkpoint_reused": False,
+                    "not_attempted_reason": "KRX_CIRCUIT_OPEN",
+                })
+            break
+
+        if (
+            stock_cooldown_seconds > 0
+            and int(batch_rest_every or 0) > 0
+            and live_attempt_count % int(batch_rest_every) == 0
+            and batch_index + 1 < total
+            and float(batch_rest_seconds or 0) > 0
+        ):
+            if progress:
+                progress(
+                    (batch_index + 1) / max(total, 1),
+                    f"KRX 안정화 대기 · {live_attempt_count}개 실수집 후 {int(batch_rest_seconds)}초 휴식",
+                )
+            time.sleep(float(batch_rest_seconds))
+        elif stock_cooldown_seconds > 0:
             time.sleep(float(stock_cooldown_seconds))
 
     manifest_df = pd.DataFrame(manifest_rows).sort_values("development_selection_order").reset_index(drop=True)
@@ -2435,7 +2561,7 @@ def build_development_flow_batch_with_active_session(
     manifest_bytes = manifest_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
     files["batch_manifest.csv"] = manifest_bytes
     audit_obj = {
-        "app_build": "APP_v1.0.19",
+        "app_build": "APP_v1.0.21",
         "flow_batch_engine": FLOW_BATCH_ENGINE_VERSION,
         "flow_engine": FLOW_ENGINE_VERSION,
         "job_id": job_id,
@@ -2444,6 +2570,10 @@ def build_development_flow_batch_with_active_session(
         "requested_stock_count": int(total),
         "successful_stock_count": int((manifest_df["status"] == "OK").sum()),
         "checkpoint_reused_count": int(manifest_df["checkpoint_reused"].sum()),
+        "circuit_breaker_triggered": bool(circuit_breaker_triggered),
+        "not_attempted_circuit_open_count": int((manifest_df["status"] == "NOT_ATTEMPTED_CIRCUIT_OPEN").sum()),
+        "batch_rest_every": int(batch_rest_every or 0),
+        "batch_rest_seconds": float(batch_rest_seconds or 0),
         "credentials_stored": False,
         "same_runtime_resume_supported": True,
         "zero_fill_used": False,
@@ -2579,8 +2709,11 @@ def make_integrated_universe_flow_batch_bundle(
     checkpoint_root=None,
     ohlcv_fetcher=None,
     flow_max_days=365,
-    flow_sleep_seconds=0.25,
-    stock_cooldown_seconds=2.0,
+    flow_sleep_seconds=0.35,
+    stock_cooldown_seconds=3.0,
+    batch_rest_every=10,
+    batch_rest_seconds=60.0,
+    response_backoff_seconds=(20.0, 60.0, 120.0),
 ):
     """Create the point-in-time Universe and collect the first N stocks in one login."""
     if not (login_id and login_pw):
@@ -2601,10 +2734,39 @@ def make_integrated_universe_flow_batch_bundle(
     try:
         if progress:
             progress(0.0, "1/2 · KRX 로그인 중")
-        auth_session = KRXSession()
-        if not auth_session.refresh(login_id, login_pw):
-            raise PermissionError("KRX_LOGIN_REJECTED")
-        set_auth_session(auth_session)
+        # Initial KRX login can fail transiently when the server returns a
+        # non-JSON/HTML response even with valid credentials.  v1.0.21 retries
+        # with a fresh KRXSession so a single JSONDecodeError does not abort the
+        # whole integrated job.  Credentials are never written to diagnostics.
+        login_errors = []
+        auth_session = None
+        for login_attempt in range(1, 4):
+            candidate = KRXSession()
+            try:
+                login_ok = bool(candidate.refresh(login_id, login_pw))
+                if login_ok:
+                    auth_session = candidate
+                    set_auth_session(auth_session)
+                    break
+                login_errors.append(f"attempt={login_attempt}: KRX_LOGIN_REJECTED")
+            except Exception as ex:
+                login_errors.append(
+                    f"attempt={login_attempt}: {type(ex).__name__}: {ex}"
+                )
+            try:
+                candidate.session.close()
+            except Exception:
+                pass
+            if login_attempt < 3:
+                time.sleep(float(login_attempt))
+
+        if auth_session is None:
+            if login_errors and all("KRX_LOGIN_REJECTED" in item for item in login_errors):
+                raise PermissionError("KRX_LOGIN_REJECTED")
+            last_error = login_errors[-1] if login_errors else "unknown login response error"
+            raise RuntimeError(
+                "KRX_LOGIN_RESPONSE_ERROR_AFTER_3_ATTEMPTS: " + last_error
+            )
 
         if progress:
             progress(0.01, "1/2 · Point-in-Time Universe 생성 중")
@@ -2633,14 +2795,73 @@ def make_integrated_universe_flow_batch_bundle(
                 f"1/2 · Universe 완료 {len(universe_full):,}종목 · 수집대상 {len(selection)}종목",
             )
 
+        def replace_authenticated_session(wait_seconds=0.0):
+            nonlocal auth_session
+            if wait_seconds > 0:
+                time.sleep(float(wait_seconds))
+            old_session = auth_session
+            candidate = KRXSession()
+            try:
+                ok = bool(candidate.refresh(login_id, login_pw))
+                if not ok:
+                    try:
+                        candidate.session.close()
+                    except Exception:
+                        pass
+                    return False
+                auth_session = candidate
+                set_auth_session(auth_session)
+                try:
+                    if old_session is not None:
+                        old_session.session.close()
+                except Exception:
+                    pass
+                return True
+            except Exception:
+                try:
+                    candidate.session.close()
+                except Exception:
+                    pass
+                return False
+
         def reauthenticate():
+            nonlocal auth_session
+            # Preserve the fast v1.0.20 path first.
             try:
                 ok = bool(auth_session.refresh(login_id, login_pw))
                 if ok:
                     set_auth_session(auth_session)
-                return ok
+                    return True
             except Exception:
-                return False
+                pass
+            for wait_seconds in (0.0, 1.0):
+                if replace_authenticated_session(wait_seconds):
+                    return True
+            return False
+
+        def recover_from_response_block(ticker):
+            events = []
+            for wait_seconds in tuple(response_backoff_seconds or ()):
+                event = {
+                    "wait_seconds": float(wait_seconds),
+                    "session_rebuilt": False,
+                    "probe_status": "",
+                    "probe_error": "",
+                }
+                rebuilt = replace_authenticated_session(wait_seconds)
+                event["session_rebuilt"] = bool(rebuilt)
+                if not rebuilt:
+                    events.append(event)
+                    continue
+                # A successful login alone was not enough in the live v1.0.20 run.
+                # Require a real KRX JSON finder response before closing the breaker.
+                _, probe_status, probe_error = _krx_find_isin(auth_session, str(ticker).zfill(6))
+                event["probe_status"] = str(probe_status)
+                event["probe_error"] = str(probe_error)
+                events.append(event)
+                if probe_status == "FINDER_OK":
+                    return True, events
+            return False, events
 
         def active_session_ohlcv_fetcher(ticker, fetch_start, fetch_end):
             if hasattr(auth_session, "is_valid") and not auth_session.is_valid():
@@ -2649,15 +2870,7 @@ def make_integrated_universe_flow_batch_bundle(
             frame, diagnostics = fetch_krx_direct_raw_with_active_session(
                 auth_session, ticker, fetch_start, fetch_end
             )
-            chunks = diagnostics.get("chunks", []) if isinstance(diagnostics, dict) else []
-            recoverable = (
-                frame.empty
-                and isinstance(diagnostics, dict)
-                and (
-                    bool(diagnostics.get("isin_error"))
-                    or any(str(chunk.get("status", "")) == "REQUEST_ERROR" for chunk in chunks)
-                )
-            )
+            recoverable = frame.empty and _diagnostics_has_krx_response_error(diagnostics)
             if recoverable and reauthenticate():
                 time.sleep(1.0)
                 frame, diagnostics = fetch_krx_direct_raw_with_active_session(
@@ -2665,6 +2878,24 @@ def make_integrated_universe_flow_batch_bundle(
                 )
                 if isinstance(diagnostics, dict):
                     diagnostics["reauthenticated_after_response_error"] = True
+
+            if frame.empty and _diagnostics_has_krx_response_error(diagnostics):
+                recovered, recovery_events = recover_from_response_block(ticker)
+                if recovered:
+                    frame, diagnostics = fetch_krx_direct_raw_with_active_session(
+                        auth_session, ticker, fetch_start, fetch_end
+                    )
+                    if isinstance(diagnostics, dict):
+                        diagnostics["recovered_after_controlled_backoff"] = True
+                        diagnostics["recovery_events"] = recovery_events
+                if frame.empty and _diagnostics_has_krx_response_error(diagnostics):
+                    final_diag = dict(diagnostics) if isinstance(diagnostics, dict) else {}
+                    final_diag.update({
+                        "status": "KRX_CIRCUIT_OPEN",
+                        "circuit_open": True,
+                        "recovery_events": recovery_events,
+                    })
+                    return pd.DataFrame(), final_diag
             return frame, diagnostics
 
         def batch_progress(value, message):
@@ -2684,6 +2915,9 @@ def make_integrated_universe_flow_batch_bundle(
             flow_sleep_seconds=flow_sleep_seconds,
             stock_cooldown_seconds=stock_cooldown_seconds,
             reauthenticate=reauthenticate,
+            response_recovery=recover_from_response_block,
+            batch_rest_every=batch_rest_every,
+            batch_rest_seconds=batch_rest_seconds,
             universe_full=universe_full,
             universe_order=universe_order,
             universe_audit=universe_audit,
@@ -2714,14 +2948,14 @@ def fetch_flow_cached(ticker, start, end):
     return fetch_investor_flow_by_date(ticker, start, end)
 
 
-st.title("Korea OHLCV CSV v1.0.19 UNIVERSE + OHLCV + FLOW 99")
+st.title("Korea OHLCV CSV v1.0.21 UNIVERSE + OHLCV + FLOW 99")
 st.caption(
     "개별주식 KRX DIRECT RAW + KOSPI/KOSDAQ 지수(FDR) + "
     "Track 02 Development Universe · 99종목 일괄 수집 · 원본 보존 · outcome-blind"
 )
 
 st.caption(
-    "BUILD: APP_v1.0.19 / UNIVERSE_DIRECT_v0.1.0 / "
+    "BUILD: APP_v1.0.21 / UNIVERSE_DIRECT_v0.1.0 / "
     "BATCH_OHLCV_v0.6 / INVESTOR_FLOW_INPUT_v0.3.0 / FLOW_BATCH_v0.2.0"
 )
 
