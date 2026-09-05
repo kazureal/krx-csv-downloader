@@ -25,7 +25,7 @@ from universe_engine_v0_1_14 import (
     deterministic_selection_order,
 )
 
-st.set_page_config(page_title="Korea OHLCV CSV v1.0.21 UNIVERSE + FLOW 99", page_icon="📈")
+st.set_page_config(page_title="Korea OHLCV CSV v1.0.22 UNIVERSE + FLOW 99", page_icon="📈")
 
 H = {
     "User-Agent": "Mozilla/5.0",
@@ -67,7 +67,7 @@ FLOW_ENGINE_VERSION = "INVESTOR_FLOW_INPUT_v0.3.0_20260902"
 FLOW_BATCH_ENGINE_VERSION = "FLOW_BATCH_v0.2.0_20260902"
 UNIVERSE_DIRECT_ENGINE_VERSION = "UNIVERSE_DIRECT_v0.1.0_20260902"
 FLOW_BATCH_TARGET_COUNT = 99
-FLOW_BATCH_CHECKPOINT_ROOT = Path(tempfile.gettempdir()) / "hrf_flow_batch_v1_0_21"
+FLOW_BATCH_CHECKPOINT_ROOT = Path(tempfile.gettempdir()) / "hrf_flow_batch_v1_0_22"
 UNIVERSE_MARKET_IDS = {"KOSPI": "STK", "KOSDAQ": "KSQ"}
 FLOW_SOURCE = "KRX_VIA_PYKRX_INVESTOR_BY_DATE"
 FLOW_INVESTOR_ALIASES = {
@@ -82,7 +82,7 @@ FLOW_CORE_INVESTORS = ("institution", "foreign")
 FLOW_ALL_INVESTORS = ("institution", "foreign", "individual", "other_corporation")
 FLOW_AUTH_LOCK = threading.Lock()
 
-# v1.0.21 live-stability controls. These do not change HRF CORE/S1/NEXT.
+# v1.0.22 live-stability controls. These do not change HRF CORE/S1/NEXT.
 # The 2026-09-04 DEV99 live run showed a persistent non-JSON KRX response
 # after 13 successful stocks. Immediate re-login alone did not recover it.
 KRX_RESPONSE_BACKOFF_SECONDS = (20.0, 60.0, 120.0)
@@ -165,10 +165,45 @@ def _krx_headers():
 
 
 def _krx_login(session, login_id, login_pw):
-    """선택적 KRX 로그인. ID/PW는 저장/CSV출력/로그표시하지 않는다."""
-    diag = {"attempted": False, "success": False, "code": "", "message": ""}
+    """선택적 KRX 로그인. ID/PW는 저장/CSV출력/로그표시하지 않는다.
+
+    v1.0.22: KRX가 로그인 POST에 JSON이 아닌 HTML/빈 응답을 반환해도
+    JSONDecodeError를 그대로 전파하지 않고 응답 형태만 진단한다.
+    응답 본문과 자격증명은 진단/로그에 저장하지 않는다.
+    """
+    diag = {
+        "attempted": False,
+        "success": False,
+        "code": "",
+        "message": "",
+        "http_status": None,
+        "content_type": "",
+        "response_kind": "",
+        "response_length": 0,
+    }
     if not (login_id and login_pw):
         return diag
+
+    def parse_login_response(resp):
+        diag["http_status"] = int(getattr(resp, "status_code", 0) or 0)
+        diag["content_type"] = str(getattr(resp, "headers", {}).get("Content-Type", ""))
+        text = str(getattr(resp, "text", "") or "")
+        diag["response_length"] = len(text)
+        stripped = text.lstrip()
+        if not stripped:
+            diag["response_kind"] = "EMPTY"
+            return None
+        try:
+            data = resp.json()
+        except Exception:
+            low = stripped[:64].lower()
+            if low.startswith("<!doctype html") or low.startswith("<html") or "<html" in low:
+                diag["response_kind"] = "HTML"
+            else:
+                diag["response_kind"] = "NON_JSON_TEXT"
+            return None
+        diag["response_kind"] = "JSON"
+        return data
 
     diag["attempted"] = True
     h = _krx_headers()
@@ -189,7 +224,15 @@ def _krx_login(session, login_id, login_pw):
             headers={"User-Agent": h["User-Agent"], "Referer": KRX_LOGIN_PAGE},
             timeout=20,
         )
-        data = r.json()
+        data = parse_login_response(r)
+        if data is None:
+            diag.update({
+                "success": False,
+                "code": "NON_JSON_RESPONSE",
+                "message": "KRX login response was not JSON",
+            })
+            return diag
+
         code = str(data.get("_error_code", ""))
         msg = str(data.get("_error_message", ""))
         if code == "CD011":  # 중복 로그인
@@ -200,13 +243,56 @@ def _krx_login(session, login_id, login_pw):
                 headers={"User-Agent": h["User-Agent"], "Referer": KRX_LOGIN_PAGE},
                 timeout=20,
             )
-            data = r.json()
+            data = parse_login_response(r)
+            if data is None:
+                diag.update({
+                    "success": False,
+                    "code": "NON_JSON_RESPONSE",
+                    "message": "KRX duplicate-login response was not JSON",
+                })
+                return diag
             code = str(data.get("_error_code", ""))
             msg = str(data.get("_error_message", ""))
         diag.update({"success": code == "CD001", "code": code, "message": msg})
     except Exception as ex:
-        diag.update({"success": False, "code": "EXCEPTION", "message": f"{type(ex).__name__}: {ex}"})
+        diag.update({
+            "success": False,
+            "code": "TRANSPORT_EXCEPTION",
+            "message": f"{type(ex).__name__}: {ex}",
+        })
     return diag
+
+
+def _activate_pykrx_candidate_session(candidate, login_id, login_pw):
+    """Log a pykrx KRXSession in through the guarded app-level login path.
+
+    This bypasses pykrx login_krx()'s unconditional resp.json() call while
+    preserving the KRXSession state expected by pykrx after successful login.
+    Credentials and response bodies are never persisted.
+    """
+    try:
+        candidate.session.close()
+    except Exception:
+        pass
+    candidate.session = requests.Session()
+    diag = _krx_login(candidate.session, login_id, login_pw)
+    if not bool(diag.get("success")):
+        return False, diag
+
+    now = time.time()
+    candidate.login_time = now
+    candidate.expiry_time = now + 3600
+    candidate.is_authenticated = True
+    candidate.cookies = {}
+    for cookie in candidate.session.cookies:
+        candidate.cookies[cookie.name] = {
+            "value": cookie.value,
+            "domain": cookie.domain,
+            "path": cookie.path,
+            "secure": cookie.secure,
+            "expires": cookie.expires or 0,
+        }
+    return True, diag
 
 
 def _krx_find_isin(session, code):
@@ -1141,7 +1227,7 @@ def make_batch_bundle(order_slice, start_date, end_date, login_id="", login_pw="
     files[f"{filename_time_prefix()}_batch_manifest.csv"] = manifest_bytes
 
     audit_obj = {
-        "app_build": "APP_v1.0.21",
+        "app_build": "APP_v1.0.22",
         "engine_build": "UNIVERSE_ENGINE_v0.1.14",
         "batch_start_order": int(order_slice["development_selection_order"].min()),
         "batch_end_order": int(order_slice["development_selection_order"].max()),
@@ -2561,7 +2647,7 @@ def build_development_flow_batch_with_active_session(
     manifest_bytes = manifest_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
     files["batch_manifest.csv"] = manifest_bytes
     audit_obj = {
-        "app_build": "APP_v1.0.21",
+        "app_build": "APP_v1.0.22",
         "flow_batch_engine": FLOW_BATCH_ENGINE_VERSION,
         "flow_engine": FLOW_ENGINE_VERSION,
         "job_id": job_id,
@@ -2734,38 +2820,75 @@ def make_integrated_universe_flow_batch_bundle(
     try:
         if progress:
             progress(0.0, "1/2 · KRX 로그인 중")
-        # Initial KRX login can fail transiently when the server returns a
-        # non-JSON/HTML response even with valid credentials.  v1.0.21 retries
-        # with a fresh KRXSession so a single JSONDecodeError does not abort the
-        # whole integrated job.  Credentials are never written to diagnostics.
-        login_errors = []
+        # v1.0.22 guards the initial login itself. pykrx's login_krx() calls
+        # resp.json() unconditionally, so an HTML/empty KRX response previously
+        # surfaced as JSONDecodeError before the v1.0.22 batch recovery logic
+        # could run.  Use the app-level guarded login and slow backoff here.
+        # Credentials and response bodies are never written to diagnostics.
+        login_events = []
         auth_session = None
-        for login_attempt in range(1, 4):
+        initial_login_waits = (0.0,) + tuple(response_backoff_seconds or ())
+        for login_attempt, wait_seconds in enumerate(initial_login_waits, start=1):
+            if wait_seconds > 0:
+                if progress:
+                    progress(
+                        0.0,
+                        f"1/2 · KRX 로그인 응답 회복 대기 {int(wait_seconds)}초 "
+                        f"({login_attempt}/{len(initial_login_waits)})",
+                    )
+                time.sleep(float(wait_seconds))
+
             candidate = KRXSession()
-            try:
-                login_ok = bool(candidate.refresh(login_id, login_pw))
-                if login_ok:
-                    auth_session = candidate
-                    set_auth_session(auth_session)
-                    break
-                login_errors.append(f"attempt={login_attempt}: KRX_LOGIN_REJECTED")
-            except Exception as ex:
-                login_errors.append(
-                    f"attempt={login_attempt}: {type(ex).__name__}: {ex}"
-                )
+            login_ok, login_diag = _activate_pykrx_candidate_session(
+                candidate, login_id, login_pw
+            )
+            event = {
+                "attempt": int(login_attempt),
+                "wait_seconds": float(wait_seconds),
+                "success": bool(login_ok),
+                "code": str(login_diag.get("code", "")),
+                "http_status": login_diag.get("http_status"),
+                "content_type": str(login_diag.get("content_type", "")),
+                "response_kind": str(login_diag.get("response_kind", "")),
+                "response_length": int(login_diag.get("response_length", 0) or 0),
+            }
+            login_events.append(event)
+
+            if login_ok:
+                auth_session = candidate
+                set_auth_session(auth_session)
+                break
+
             try:
                 candidate.session.close()
             except Exception:
                 pass
-            if login_attempt < 3:
-                time.sleep(float(login_attempt))
+
+            code = str(login_diag.get("code", ""))
+            # A valid JSON login rejection is not a transient non-JSON outage.
+            if code == "CD010":
+                raise PermissionError("KRX_PASSWORD_CHANGE_REQUIRED")
+            if code not in {"NON_JSON_RESPONSE", "TRANSPORT_EXCEPTION"}:
+                raise PermissionError(f"KRX_LOGIN_REJECTED:{code or 'UNKNOWN'}")
 
         if auth_session is None:
-            if login_errors and all("KRX_LOGIN_REJECTED" in item for item in login_errors):
-                raise PermissionError("KRX_LOGIN_REJECTED")
-            last_error = login_errors[-1] if login_errors else "unknown login response error"
+            last = login_events[-1] if login_events else {}
+            kinds = {str(item.get("response_kind", "")) for item in login_events}
+            codes = {str(item.get("code", "")) for item in login_events}
+            if codes == {"NON_JSON_RESPONSE"} or (
+                "NON_JSON_RESPONSE" in codes and codes <= {"NON_JSON_RESPONSE", "TRANSPORT_EXCEPTION"}
+            ):
+                raise RuntimeError(
+                    "KRX_LOGIN_NON_JSON_PERSISTENT: "
+                    f"attempts={len(login_events)}, "
+                    f"last_http={last.get('http_status')}, "
+                    f"last_content_type={last.get('content_type')}, "
+                    f"last_kind={last.get('response_kind')}, "
+                    f"last_length={last.get('response_length')}"
+                )
             raise RuntimeError(
-                "KRX_LOGIN_RESPONSE_ERROR_AFTER_3_ATTEMPTS: " + last_error
+                "KRX_LOGIN_TRANSPORT_FAILURE: "
+                f"attempts={len(login_events)}, last_code={last.get('code')}"
             )
 
         if progress:
@@ -2802,7 +2925,9 @@ def make_integrated_universe_flow_batch_bundle(
             old_session = auth_session
             candidate = KRXSession()
             try:
-                ok = bool(candidate.refresh(login_id, login_pw))
+                ok, _ = _activate_pykrx_candidate_session(
+                    candidate, login_id, login_pw
+                )
                 if not ok:
                     try:
                         candidate.session.close()
@@ -2948,14 +3073,14 @@ def fetch_flow_cached(ticker, start, end):
     return fetch_investor_flow_by_date(ticker, start, end)
 
 
-st.title("Korea OHLCV CSV v1.0.21 UNIVERSE + OHLCV + FLOW 99")
+st.title("Korea OHLCV CSV v1.0.22 UNIVERSE + OHLCV + FLOW 99")
 st.caption(
     "개별주식 KRX DIRECT RAW + KOSPI/KOSDAQ 지수(FDR) + "
     "Track 02 Development Universe · 99종목 일괄 수집 · 원본 보존 · outcome-blind"
 )
 
 st.caption(
-    "BUILD: APP_v1.0.21 / UNIVERSE_DIRECT_v0.1.0 / "
+    "BUILD: APP_v1.0.22 / UNIVERSE_DIRECT_v0.1.0 / "
     "BATCH_OHLCV_v0.6 / INVESTOR_FLOW_INPUT_v0.3.0 / FLOW_BATCH_v0.2.0"
 )
 
